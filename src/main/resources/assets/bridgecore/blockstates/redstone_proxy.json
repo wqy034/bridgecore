@@ -1,0 +1,6 @@
+{
+  "variants": {
+    "mode=attitude": { "model": "bridgecore:block/attitude_proxy" },
+    "mode=translation": { "model": "bridgecore:block/translation_proxy" }
+  }
+}

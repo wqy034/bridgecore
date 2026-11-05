@@ -1,0 +1,60 @@
+BridgeCore Third-Party Notices
+==============================
+
+BridgeCore incorporates code or technical approaches derived from the
+following MIT-licensed projects. The MIT license text below applies to each
+of these components and accompanies their respective copyright notices.
+
+1. shao's Flight Control with CC & VS
+   Project: https://github.com/super95shao/shao-s-Flight-Control-with-cc-vs
+   Reference: flight-control laws ported from Lua to Java.
+   Copyright (c) 2024 super95shao
+
+2. FireControl
+   Project: https://github.com/super95shao/FireControl
+   Reference: fire-control Lua, quaternion library, and ballistic mathematics.
+   Copyright (c) 2024 shao
+
+3. Create: Fire Control 0.7.1
+   Project: https://www.curseforge.com/minecraft/mc-mods/create-fire-control
+   Reference: swivel-bearing stabilization and AxisLock mechanisms.
+   Copyright (c) BaiCaiYu1123 and contributors
+
+4. Tom's Peripherals
+   Project: https://github.com/tom5454/Toms-Peripherals
+   Reference: display implementation.
+   Copyright (c) 2023 tom5454
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Design-only Reference
+---------------------
+
+VoidPower by dfdyz provided design inspiration for synchronization and
+holographic-display patterns. No code was copied from that project. Its own
+license is not identified as MIT; this notice does not relicense or claim any
+rights to VoidPower.
+
+Bundled Font Licenses
+---------------------
+
+The font resources under src/main/resources/assets/bridgecore/fonts/ retain
+their original SIL Open Font License notices in the adjacent OFL-*.txt files.

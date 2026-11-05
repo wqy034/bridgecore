@@ -1,0 +1,171 @@
+plugins {
+    id 'java-library'
+    id 'idea'
+    id 'maven-publish'
+    id 'net.neoforged.moddev' version '2.0.142'
+}
+
+version = mod_version
+group = mod_group_id
+
+base {
+    archivesName = mod_id
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+    withSourcesJar()
+}
+
+neoForge {
+    version = project.neo_version
+
+    runs {
+        configureEach {
+            systemProperty 'forge.logging.markers', 'REGISTRIES'
+            systemProperty 'forge.logging.console.level', 'debug'
+            systemProperty 'forge.enabledGameTestNamespaces', mod_id
+        }
+        client {
+            client()
+        }
+        server {
+            server()
+            programArgument '--nogui'
+        }
+        gameTestServer {
+            type = "gameTestServer"
+            programArgument '--nogui'
+        }
+    }
+
+    mods {
+        // Bind the project source set to the mod id so dev-run mod discovery
+        // (mods.toml + annotation scan) sees our classes. cbc_ee does the same.
+        "${mod_id}" {
+            sourceSet(sourceSets.main)
+        }
+    }
+}
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+    maven {
+        name = 'Sable'
+        url = 'https://maven.ryanhcode.dev/releases'
+        content {
+            includeGroup('dev.ryanhcode.sable')
+            includeGroup('dev.ryanhcode.sable-companion')
+        }
+    }
+    maven {
+        name = 'Modrinth'
+        url = 'https://api.modrinth.com/maven'
+        content { includeGroup('maven.modrinth') }
+    }
+    // The Modrinth Maven coordinate maven.modrinth:cc-tweaked:1.120.0 resolves to the wrong artifact
+    // (the LexForge twin — version-number ambiguity; sha1 mismatch vs the CDN).
+    // The verified NeoForge jar (sha1 d992be39..., CDN version 8XEJbAee) lives in
+    // devlibs/ + run/mods/ like the other non-maven mods.
+}
+
+dependencies {
+    // Sable (Create: Aeronautics physics) — HARD dependency for bridgecore:
+    // no Sable, no ship, no point. Compile-time API from maven; transitive
+    // resolution disabled because its pom points at unreachable mirrors.
+    compileOnly("dev.ryanhcode.sable:sable-neoforge-${minecraft_version}:2.0.3") { transitive = false }
+    compileOnly("dev.ryanhcode.sable-companion:sable-companion-${minecraft_version}:1.4.0") { transitive = false }
+
+    // Dev-runtime mods, cbc_ee-style: maven-available mods go on `implementation`
+    // (lands on runtimeClasspath, FML's mod locator DOES scan that in dev runs).
+    // Create is required at runtime by aeronautics; jar-in-jars flywheel/ponder/registrate.
+    implementation "maven.modrinth:create:6.0.10+mc1.21.1"
+
+    // Mods NOT on maven (sable, create-aeronautics-bundled) live in run/mods/
+    // (canonical copies in devlibs/). Do NOT put them in additionalRuntimeClasspath:
+    // plain file deps there are not discovered as mods, and the same jar on both
+    // classpath and run/mods triggers JPMS "two modules export the same package".
+
+    // simulated (hosts the Linked Typewriter, M3k keyboard input) — nested inside
+    // create-aeronautics-bundled's jarjar; canonical extracted copy in devlibs/.
+    // COMPILE ONLY: runtime classes come from the bundled jar already in run/mods.
+    compileOnly files("$rootDir/devlibs/simulated-nested-neoforge-1.21.1-1.3.0.jar")
+    // Ponder: SmartBlockEntity (typewriter BE's superclass) implements its
+    // VirtualBlockEntity — needed on the COMPILE classpath only for hierarchy
+    // resolution; runtime gets it from Create's jarjar. Canonical copy in devlibs/
+    // (its maven isn't declared in this build; extracted from the gradle cache).
+    compileOnly files("$rootDir/devlibs/ponder-neoforge-1.0.82+mc1.21.1.jar")
+
+    // Create: Tweaked Controllers (M3a gamepad input) — SOFT dependency, compile-time
+    // only (runtime = user-installed jar in run/mods; the client reader is guarded
+    // by a ModList check). Transitives off: its pom's Create dep is satisfied by
+    // the bundled aeronautics jar at runtime.
+    compileOnly("maven.modrinth:create-tweaked-controllers:1.21.1-1.2.7") { transitive = false }
+
+    // CC:Tweaked (channel-table peripherals) — SOFT dependency, compile-time only
+    // against the verified NeoForge jar (see repositories note above); the dev
+    // runtime copy sits in run/mods/. Every CC reference lives in the
+    // com.bridgecore.cc package behind a ModList "computercraft" check, so the
+    // mod runs fine without CC.
+    compileOnly files("$rootDir/devlibs/cc-tweaked-1.21.1-forge-1.120.0.jar")
+
+    // FE Railgun / CBC:EE (电磁炮 P3 fire-control integration) — SOFT dependency,
+    // compile-time only (runtime = user-installed jar in run/mods; every reference
+    // lives in the firecontrol.railgun package behind a ModList "fe_railgun" check).
+    compileOnly files("$rootDir/devlibs/fe_railgun-1.7.0-alpha.jar")
+
+    // JUnit 5 for unit tests (fire-control golden-vector diff tests live in
+    // src/test/). Pure increment, no existing configuration touched.
+    // Contract tests execute the installed CC terminal implementation, without launching Minecraft.
+    testImplementation files("$rootDir/devlibs/cc-tweaked-1.21.1-forge-1.120.0.jar")
+    // Use the Lua engine bundled inside that same jar for ROM/API integration tests.
+    testImplementation files(zipTree("$rootDir/devlibs/cc-tweaked-1.21.1-forge-1.120.0.jar").matching {
+        include 'META-INF/jarjar/cobalt-*.jar'
+    })
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.withType(ProcessResources).configureEach {
+    var replaceProperties = [
+            minecraft_version: minecraft_version, minecraft_version_range: minecraft_version_range,
+            neo_version: neo_version, neo_version_range: neo_version_range,
+            loader_version_range: loader_version_range,
+            mod_id: mod_id, mod_name: mod_name, mod_license: mod_license, mod_version: mod_version,
+            mod_authors: mod_authors, mod_description: mod_description,
+    ]
+    inputs.properties replaceProperties
+
+    filesMatching(['META-INF/neoforge.mods.toml', 'pack.mcmeta']) {
+        expand replaceProperties + [project: project]
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+// [firecontrol] 2026-09-11: enable JUnit 5 for src/test (golden-vector tests)
+test {
+    useJUnitPlatform()
+    // An isolated loader denies CC while linking display signatures against the local MC APIs.
+    systemProperty 'bridgecore.linkClasspath', (sourceSets.main.output + sourceSets.main.compileClasspath).asPath
+}
+
+jar {
+    manifest {
+        attributes([
+                'Specification-Title'     : mod_id,
+                'Specification-Vendor'    : mod_authors,
+                'Specification-Version'   : '1',
+                'Implementation-Title'    : project.name,
+                'Implementation-Version'  : project.jar.archiveVersion,
+                'Implementation-Vendor'   : mod_authors,
+                'Implementation-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")
+        ])
+    }
+}

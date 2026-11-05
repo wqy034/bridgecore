@@ -1,0 +1,5 @@
+{
+  "variants": {
+    "": { "model": "bridgecore:block/momentum_distributor" }
+  }
+}

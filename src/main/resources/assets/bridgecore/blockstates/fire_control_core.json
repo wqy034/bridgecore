@@ -1,0 +1,5 @@
+{
+  "variants": {
+    "": { "model": "bridgecore:block/fire_control_core" }
+  }
+}

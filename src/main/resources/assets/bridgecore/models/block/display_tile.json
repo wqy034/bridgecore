@@ -1,0 +1,12 @@
+{
+  "parent": "minecraft:block/cube",
+  "textures": {
+    "particle": "bridgecore:block/display_tile_side",
+    "down": "bridgecore:block/display_tile_side",
+    "up": "bridgecore:block/display_tile_side",
+    "north": "bridgecore:block/display_tile_front",
+    "south": "bridgecore:block/display_tile_side",
+    "east": "bridgecore:block/display_tile_side",
+    "west": "bridgecore:block/display_tile_side"
+  }
+}

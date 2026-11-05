@@ -1,0 +1,13 @@
+{
+  "type": "minecraft:crafting_shapeless",
+  "category": "misc",
+  "ingredients": [
+    { "item": "minecraft:ender_pearl" },
+    { "item": "minecraft:blaze_powder" },
+    { "item": "minecraft:redstone" }
+  ],
+  "result": {
+    "id": "bridgecore:end_essence",
+    "count": 1
+  }
+}

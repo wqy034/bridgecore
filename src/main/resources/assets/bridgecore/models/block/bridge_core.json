@@ -1,0 +1,8 @@
+{
+  "parent": "minecraft:block/orientable",
+  "textures": {
+    "top": "bridgecore:block/bridge_core_top",
+    "front": "bridgecore:block/bridge_core_front",
+    "side": "bridgecore:block/bridge_core_side"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "variants": {
+    "facing=north": { "model": "bridgecore:block/bridge_core" },
+    "facing=south": { "model": "bridgecore:block/bridge_core", "y": 180 },
+    "facing=east": { "model": "bridgecore:block/bridge_core", "y": 90 },
+    "facing=west": { "model": "bridgecore:block/bridge_core", "y": 270 }
+  }
+}

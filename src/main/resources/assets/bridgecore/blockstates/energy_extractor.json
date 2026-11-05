@@ -1,0 +1,6 @@
+{
+  "variants": {
+    "lit=false": { "model": "bridgecore:block/energy_extractor" },
+    "lit=true": { "model": "bridgecore:block/energy_extractor_on" }
+  }
+}

@@ -1,0 +1,13 @@
+.gradle/
+build/
+run/
+logs/
+.vscode/
+.idea/
+*.iml
+*.log
+.tmp-dec/
+.tmp-fonts/
+devlibs/
+legacy-export/
+tools/font/dl/

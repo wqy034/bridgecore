@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "package": "com.bridgecore.mixin",
+  "plugin": "com.bridgecore.mixin.BridgeCoreMixinPlugin",
+  "mixins": [
+    "TweakedLecternRangeMixin",
+    "SwivelBearingAccessorMixin",
+    "SwivelBearingAxisLockMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
