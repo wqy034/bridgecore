@@ -78,8 +78,8 @@ public final class FireControlHudTargetProvider implements HudTargetProvider {
     public List<ChannelTaskView> channelTasks(Level level, @Nullable ServerSubLevel sub) {
         FireControlCoreBlockEntity core = firstCore(level, sub);
         if (core == null) return List.of();
-        List<ChannelTaskView> out = new ArrayList<>(FireControlCoreBlockEntity.CHANNEL_COUNT);
-        for (int ch = 0; ch < FireControlCoreBlockEntity.CHANNEL_COUNT; ch++) {
+        List<ChannelTaskView> out = new ArrayList<>(core.channelCount());
+        for (int ch = 0; ch < core.channelCount(); ch++) {
             ChannelTask t = core.taskOf(ch);
             out.add(new ChannelTaskView(ch, core.channelName(ch),
                     TaskSource.valueOf(t.source().name()), TaskMode.valueOf(t.mode().name()),
@@ -111,7 +111,7 @@ public final class FireControlHudTargetProvider implements HudTargetProvider {
         boolean partialEnergy = false;
         MountLink link = MountLinks.active();
         for (TurretUnit unit : core.turrets()) {
-            if (unit.channel() != ch || !unit.actuator().isPaired()) continue;
+            if (!unit.belongsTo(ch) || !unit.actuator().isPaired()) continue;
             var mounts = unit.actuator().mounts();
             var gate = core.currentHudGate(unit.id());
             boolean active = t.mode() != ChannelTask.Mode.IDLE;
@@ -154,8 +154,18 @@ public final class FireControlHudTargetProvider implements HudTargetProvider {
                 minimumEnergy = minimumEnergy == null ? fraction : Math.min(minimumEnergy, fraction);
             }
         }
+        int macroReady = 0, macroTotal = 0;
+        String reason = "";
+        for (FixedGun gun : core.fixedGuns()) {
+            if (!gun.belongsTo(ch)) continue;
+            macroTotal++;
+            var sample = core.macroReadout(gun);
+            if (sample != null && sample.aim().ready()) macroReady++;
+            else if (reason.isEmpty()) reason = sample == null ? "状态待更新" : sample.label();
+        }
+        var macro = macroTotal == 0 ? null : new MacroStatusView(macroReady, macroTotal, reason);
         return new WeaponStatusView(task, core.channelAutoFire(ch), core.channelSalvoWaiting(ch),
-                List.copyOf(lamps), minimumEnergy, partialEnergy);
+                List.copyOf(lamps), minimumEnergy, partialEnergy, macro);
     }
 
     @Override

@@ -1,0 +1,13 @@
+{
+  "type": "minecraft:crafting_shapeless",
+  "category": "misc",
+  "ingredients": [
+    { "item": "bridgecore:basic_capacity_card" },
+    { "item": "minecraft:gold_ingot" },
+    { "item": "minecraft:redstone" }
+  ],
+  "result": {
+    "id": "bridgecore:advanced_capacity_card",
+    "count": 1
+  }
+}

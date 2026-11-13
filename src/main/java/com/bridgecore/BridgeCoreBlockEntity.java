@@ -1,6 +1,19 @@
 package com.bridgecore;
 
 import com.bridgecore.control.AttitudeController;
+import com.bridgecore.control.PointingExecution;
+import com.bridgecore.firecontrol.ballistics.Quat;
+import com.bridgecore.control.AttitudeTrim;
+import com.bridgecore.control.CargoFlight;
+import com.bridgecore.control.HoverController;
+import com.bridgecore.control.PhysicsWatchdog;
+import com.bridgecore.control.NavigationController;
+import com.bridgecore.control.NudgeDirection;
+import com.bridgecore.control.RemoteManeuver;
+import com.bridgecore.control.CruiseRouteWatch;
+import com.bridgecore.control.CruiseHeading;
+import com.bridgecore.nav.NavTerminalData;
+import com.bridgecore.nav.NavWakeProbe;
 import com.bridgecore.display.HudTargetProvider;
 import com.bridgecore.display.HudTargetProviders;
 import com.bridgecore.firecontrol.FireControlCoreBlockEntity;
@@ -12,9 +25,13 @@ import dev.ryanhcode.sable.api.physics.handle.RigidBodyHandle;
 import dev.ryanhcode.sable.companion.math.Pose3d;
 import dev.ryanhcode.sable.physics.config.dimension_physics.DimensionPhysicsData;
 import dev.ryanhcode.sable.sublevel.ServerSubLevel;
+import dev.ryanhcode.sable.sublevel.system.SubLevelPhysicsSystem;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.HolderLookup;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.DoubleTag;
 import net.minecraft.nbt.ListTag;
@@ -38,6 +55,7 @@ import org.joml.Vector3dc;
 
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -51,8 +69,6 @@ import java.util.concurrent.atomic.AtomicReference;
  * (measured 40Hz physics, 0.025s — never assume 20Hz, handoff §4.1).
  */
 public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySubLevelActor, MenuProvider {
-    /** Watchdog: alert after this many world ticks without a physics frame. */
-    private static final long WATCHDOG_TICK_THRESHOLD = 10;
     /** Redstone passthrough (§8 step 2): angular acceleration at full signal, rad/s^2. */
     private static final double REDSTONE_ALPHA = 4.0;
     /** M1 rate command: full-stick target angular rates, rad/s (yaw / pitch / roll).
@@ -79,7 +95,7 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
     private static final double FE_PER_NM_SECOND = 4.0 / 11.0;
     /** Hover cascade: outer position-error -> climb-rate gain, s^-1.
      *  Now a per-core tuning (config GUI tab 4, see Tunings). */
-    private static final double DEFAULT_HOVER_KP = 4.0;
+    private static final double DEFAULT_HOVER_KP = 1.0;
     /** Hover acceleration clamp, m/s^2 — must exceed gravity (sable default -11.0,
      *  queried live via DimensionPhysicsData) with margin. */
     private static final double HOVER_MAX_ALPHA = 20.0;
@@ -92,33 +108,10 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
      *  altitude, 2026-09-01 log.) */
     private static final double DEFAULT_CLIMB_RATE = 4.0;
     private static final double DEFAULT_CLIMB_KV = 4.0;
-    /** Predicted pull-out deceleration for the hover capture point, m/s^2.
-     *  v6.1: was 3.0 (HOVER_BRAKE_ALPHA) — but the cascade settles AT its target
-     *  (critically damped at the default tunings: zeta = climbKv / 2*sqrt(hoverKp)
-     *  = 1, no overshoot), so the target IS where the ship parks, and the
-     *  prediction must match the pull-out the force clamp can actually deliver:
-     *  net upward authority is HOVER_MAX_ALPHA - |g| = 20 - 11 = 9 m/s^2 (gravity
-     *  eats the rest of the clamp); 7.0 leaves margin for the hoverKp ramp near
-     *  the target. The 3.0-vs-20 mismatch put a captured target 3x deeper than the
-     *  ship could stop — see the 2026-09-02 mystery-descent analysis (capture
-     *  y=113, v=-15 -> target 74.7 = the exact 38 m dive the log showed). NOTE:
-     *  lowering climbKv / raising hoverKp in the tuning GUI makes the cascade
-     *  underdamped — this constant does NOT adapt. */
-    private static final double PULLOUT_ALPHA = 7.0;
-    /** Release confirmation window, physics frames: the capture fires only after the
-     *  stick has read zero for this many CONSECUTIVE frames (legacy-FC lesson: never
-     *  capture on a single release edge). 5 frames @40Hz = 125 ms. Kills one-frame
-     *  input glitches (proxy TTL blip, cross-thread timing) as capture triggers. */
-    private static final int RELEASE_CONFIRM_FRAMES = 5;
-    /** External-drift re-capture (M3 revision): once settled, being dragged this far
-     *  from the hover target for DRIFT_CONFIRM_FRAMES physics frames re-captures here. */
-    private static final double DRIFT_RECAPTURE_M = 8.0;
-    private static final int DRIFT_CONFIRM_FRAMES = 40; // 1 s @ 40 Hz
-    /** |y - targetY| below this marks the hover "settled" (arms drift detection). */
-    private static final double SETTLE_M = 1.0;
     /** M2 thrust gears: factory-default force multiplier per gear. Default gear index 2
      *  reproduces the pre-M2 THRUST_ACCEL behavior. */
-    private static final double[] DEFAULT_GEAR_MULT = {0.25, 0.5, 1.0, 2.0};
+    public static final double DEFAULT_G4_MULTIPLIER = 2.0;
+    private static final double[] DEFAULT_GEAR_MULT = {0.25, 0.5, 1.0, DEFAULT_G4_MULTIPLIER};
     public static final int GEAR_COUNT = DEFAULT_GEAR_MULT.length;
     /** Allowed multiplier range for the config GUI / payload validation. */
     public static final double GEAR_MULT_MIN = 0.05;
@@ -143,7 +136,7 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
      *   0 attitudeKd  姿态阻尼   (0.5..20,  default 6.0)
      *   1 attitudeKp  姿态刚度   (0.5..16,  default 4.0)
      *   2 transKv     平移阻尼   (0..8,     default 2.0)
-     *   3 hoverKp     悬停刚度   (0.5..16,  default 4.0)
+     *   3 hoverKp     悬停刚度   (0.5..16,  default 1.0)
      *   4 climbKv     悬停阻尼   (0.5..16,  default 4.0)
      *   5 climbRate   满杆爬升速率 (1..12,  default 4.0)
      *   6 attMaxAlpha 角加速度上限 rad/s^2 (1..20, default 8.0 = the pre-tuning
@@ -197,10 +190,6 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
     /** Altitude-follows-attitude switch (v6.0, feather click): while ON, horizontal
      *  stick relaxes the hover altitude lock so pitch converts to climb/dive. */
     private volatile boolean altitudeFollow = true;
-    /** Horizontal-stick-held flag for the altitude-follow release edge (physics thread). */
-    private boolean wasHorizontalInput;
-    /** Consecutive zero-input frames toward the release-confirm window (physics thread). */
-    private int inputZeroFrames;
     /** Starship translation-loop accel clamp (m/s^2). */
     private static final double MAX_LIN_ALPHA = 4.0;
 
@@ -401,11 +390,6 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
      *  readout. Fed from the account's per-tick settled spend. */
     private double drawFePerTick;
     private static final double DRAW_SMOOTH_ALPHA = 1.0 - Math.exp(-0.05 / 0.5);
-    /** END estimate from the measured stock decline (fed in serverTick; shared
-     *  estimator with the HUD screen so the CC channel and the HUD agree). */
-    private final EnduranceEstimator endurance = new EnduranceEstimator();
-    private volatile double enduranceSeconds = Double.POSITIVE_INFINITY;
-
     // ---- interface v1 telemetry (fire-control request #2, 2026-09-11) ----
     /** Latest immutable telemetry snapshot, produced on the physics frame and
      *  volatile-published (runs even in OFF — read-only telemetry is exempt
@@ -413,6 +397,7 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
      *  handle; consumers poll at 20 Hz and treat null/stale as "static
      *  platform" (their degrade rule, not ours). */
     private volatile TelemetrySnapshot telemetry;
+    private volatile long lastManualFlightInputTick = Long.MIN_VALUE;
     /** structureId of the current structure, recomputed when CoreDirectory
      *  membership changes (physics thread writes, volatile reads). */
     private volatile String telemetryStructureId;
@@ -446,32 +431,57 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
     private UUID pointingRequester;
     /** Last contact with the requester, System.nanoTime (server thread only). */
     private long pointingContactNanos;
+    /** TRACK_ENTITY: server-tick-resolved world center of the target entity
+     *  (volatile; the physics thread never touches Level). Null = unresolved. */
+    private volatile Vec3 pointingTrackPos;
+    /** SETTLED sustain counter (physics frames; PointingExecution thresholds). */
+    private int pointingSettleFrames;
+    private @Nullable Quat pointingSettleTarget;
+    /** 指向上一物理帧是否活跃：用于释放当帧的姿态目标重捕获。 */
+    private boolean pointingWasActive;
+    private final AtomicBoolean levelAfterPointing = new AtomicBoolean();
+    /** 导航终端单一权限（研究稿 v2 §4）：只接受此 UUID 终端的指令。
+     *  NBT 持久化；null = 未绑定。 */
+    private @Nullable UUID boundTerminalUuid;
+    /** CC 通道外设缓存（CCIntegration 管理；Object 类型是为了 CC 缺席时
+     *  本类不加载 CC 类型）。生命周期随本 BE。 */
+    private Object ccChannelPeripheral;
+
+    public Object ccChannelPeripheral() {
+        return ccChannelPeripheral;
+    }
+
+    public void setCcChannelPeripheral(Object peripheral) {
+        ccChannelPeripheral = peripheral;
+    }
 
     /** Immutable pointing request snapshot (interface v1 §2 payload + limits);
      *  renewed by replacement — every requestPointing call swaps in a fresh
      *  record with a fresh timestamp. */
     private record PointingRequest(UUID requester, PointingMode mode,
                                    @Nullable Vec3 posOrDir, @Nullable UUID targetEntity,
+                                   @Nullable Vec3 bodyAxis,
+                                   @Nullable Quat attitude,
                                    double maxAngularRate, double maxAngularAccel,
                                    long renewNanos) {
     }
 
     private long physicsFrames;
-    /** World gameTime of the most recent physics callback; Long.MIN_VALUE = never physicalized. */
-    private volatile long lastPhysicsGameTime = Long.MIN_VALUE;
-    /**
-     * NBT-persisted flag: this BE has been physicalized at least once. De-physicalization
-     * drops the blocks back into the world and rebuilds the BE, wiping runtime state —
-     * without this, the watchdog would treat the rebuilt BE as "never physicalized" and
-     * stay silent exactly when it should alert.
-     */
-    private boolean wasPhysicalized;
-    private boolean watchdogTripped;
+    private final PhysicsWatchdog physicsWatchdog = new PhysicsWatchdog();
+    private final NavigationController navigation = new NavigationController();
+    private final CruiseRouteWatch cruiseWatch = new CruiseRouteWatch();
+    private final CruiseHeading cruiseHeading = new CruiseHeading();
+    private UUID cruiseWitness;
+    private final RemoteManeuver remoteManeuver = new RemoteManeuver();
+    private boolean navigationWasActive;
+    private boolean precisionHover;
     /** Last physics frame we logged an FE-starvation warning (throttled). */
     private long lastStarveLogFrame = -1000;
 
     // Scratch objects to avoid per-frame allocation on the physics thread.
     private final Vector3d angularVelocity = new Vector3d();
+    private final Vector3d angularAcceleration = new Vector3d();
+    private final Vector3d omegaAfterAttitudeWrite = new Vector3d();
     private final Vector3d torque = new Vector3d();
     private final Vector3d angularImpulse = new Vector3d();
     private final Vector3d linearImpulse = new Vector3d();
@@ -487,15 +497,10 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
     private final Vector3d vTargetBody = new Vector3d(Double.NaN, Double.NaN, Double.NaN);
     /** Scratch for the per-frame gravity query (physics thread only). */
     private final Vector3d gravityVec = new Vector3d();
-    /** Hover altitude target (physics thread only); NaN = disarmed. */
-    private double hoverTargetY = Double.NaN;
-    /** Stick-held flag for release-edge detection (physics thread only). */
-    private boolean wasVerticalInput = false;
-    /** External-drift re-capture state (physics thread only): settled = reached the
-     *  target at least once since the last capture; driftFrames = consecutive frames
-     *  spent beyond DRIFT_RECAPTURE_M while settled. */
-    private boolean hoverSettled = false;
-    private int driftFrames = 0;
+    private final HoverController hover = new HoverController();
+    private final AttitudeTrim attitudeTrim = new AttitudeTrim();
+    private final CargoFlight cargoFlight = new CargoFlight();
+    private boolean hoverVerticalInput;
 
     public BridgeCoreBlockEntity(BlockPos pos, BlockState state) {
         super(BCRegistry.BRIDGE_CORE_BE.get(), pos, state);
@@ -519,15 +524,20 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
      *  which lands here — one transition path, no parallel logic).
      *  @return chat-ready status line */
     public String setMode(ControlMode next) {
-        if (next == ControlMode.STARSHIP) {
-            // M1: fresh entry starts in pure damping; the release-stick attitude hold
-            // arms only after the first rate-command input is released.
+        if (next != ControlMode.OFF && physicsWatchdog.timedOut()) {
+            return "[bridgecore] physics unavailable";
+        }
+        if (next != mode) {
+            // Capture from the next valid physics frame when entering STARSHIP.
+            levelAfterPointing.set(false);
             starshipAttitudeTarget.set(null);
             hadRateInput = false;
-        } else {
-            starshipAttitudeTarget.set(null); // the M1 release-stick hold is starship-only
         }
         mode = next;
+        if (next != ControlMode.STARSHIP) {
+            navigation.finish(NavigationController.Phase.MODE_CHANGED);
+            remoteManeuver.revoke();
+        }
         setChanged();
         return "[bridgecore] mode -> " + next;
     }
@@ -539,6 +549,10 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
             return "[bridgecore] self-balance is always coupled";
         }
         coupled = !coupled;
+        if (!coupled) {
+            navigation.finish(NavigationController.Phase.MODE_CHANGED);
+            remoteManeuver.revoke();
+        }
         return "[bridgecore] coupled -> " + (coupled ? "ON (release = brake)" : "OFF (Newtonian drift)");
     }
 
@@ -568,10 +582,12 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
         return drawFePerTick;
     }
 
-    /** Endurance estimate in seconds (POSITIVE_INFINITY = not in decline); the CC
-     *  channel reads this, the HUD computes its own via the shared estimator. */
     public double enduranceSeconds() {
-        return enduranceSeconds;
+        return energyStatus().enduranceSeconds();
+    }
+
+    public StructureEnergyAccount.EnergyStatus energyStatus() {
+        return energyAccount.status();
     }
 
     /** M2: cycle the thrust gear (right-click on a translation proxy). */
@@ -744,11 +760,181 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
 
     /** Interface v1 §1.2 first tier (same-structure direct read): the latest
      *  immutable telemetry snapshot, produced on the physics frame and
-     *  volatile-published, or null before the first physics frame with a valid
-     *  handle (never-physicalized bench core). Safe to poll from the server
-     *  thread at 20 Hz. */
+     *  volatile-published, or null while there is no usable physics sample.
+     *  Safe to poll from the server thread at 20 Hz. */
     public TelemetrySnapshot telemetrySnapshot() {
         return telemetry;
+    }
+
+    public boolean manualFlightInputSince(long tick) {
+        return lastManualFlightInputTick >= tick;
+    }
+
+    /** Server-side entry point for an already authorized, same-dimension supervised task. */
+    public boolean submitNavigation(UUID id, ResourceKey<Level> dimension, Vec3 target, double speed) {
+        return requestCruise(id, dimension, target, speed) == NavigationController.Admission.ACCEPTED;
+    }
+
+    public NavigationController.Admission requestCruise(UUID id, ResourceKey<Level> dimension, Vec3 target, double speed) {
+        return requestCruise(id, dimension, target, speed, CruiseHeading.DEFAULT_RATE);
+    }
+
+    public NavigationController.Admission requestCruise(UUID id, ResourceKey<Level> dimension, Vec3 target,
+                                                         double speed, double turnRate) {
+        return submitNavigation(id, dimension, target, speed, NavigationController.Profile.CRUISE, turnRate);
+    }
+
+    public enum NudgeResult { ACCEPTED, NO_SAMPLE, MOVING, NO_HEADING, REJECTED }
+
+    public boolean submitRemoteManeuver(RemoteManeuver.Owner owner, int mask, int speedTenths, boolean changed) {
+        if (mask != 0 && (isRemoved() || level == null || mode != ControlMode.STARSHIP || !(coupled || selfBalance)
+                || telemetry == null || navigation.active(level.getGameTime()) != null)) return false;
+        return remoteManeuver.update(owner, mask, speedTenths, changed, System.nanoTime());
+    }
+
+    /** Server-side entry point for one authorized translation step. */
+    public NudgeResult submitNudge(NudgeDirection direction) {
+        TelemetrySnapshot sample = telemetry;
+        if (sample == null || !(level instanceof ServerLevel server)) return NudgeResult.NO_SAMPLE;
+        Vec3 velocity = sample.velocity();
+        if (Math.hypot(velocity.x, velocity.z) > 0.35 || Math.abs(velocity.y) > 0.4) return NudgeResult.MOVING;
+        Direction facing = getBlockState().getValue(BridgeCoreBlock.FACING);
+        Vector3d bow = new Vector3d(facing.getStepX(), facing.getStepY(), facing.getStepZ());
+        sample.orientation().transform(bow);
+        var offset = direction.offset(bow.x, bow.z);
+        if (offset == null) return NudgeResult.NO_HEADING;
+        Vec3 target = sample.position().add(offset.x(), offset.y(), offset.z());
+        return submitNavigation(UUID.randomUUID(), server.dimension(), target, 0.6,
+                NavigationController.Profile.NUDGE, CruiseHeading.DEFAULT_RATE)
+                == NavigationController.Admission.ACCEPTED
+                ? NudgeResult.ACCEPTED : NudgeResult.REJECTED;
+    }
+
+    private NavigationController.Admission submitNavigation(UUID id, ResourceKey<Level> dimension, Vec3 target,
+                                                             double speed, NavigationController.Profile profile,
+                                                             double turnRate) {
+        if (!(level instanceof ServerLevel server) || isRemoved()
+                || mode != ControlMode.STARSHIP || !(coupled || selfBalance)) {
+            return NavigationController.Admission.UNAVAILABLE;
+        }
+        if (!server.dimension().equals(dimension) || id == null || target == null
+                || !Double.isFinite(target.x) || !Double.isFinite(target.y) || !Double.isFinite(target.z)
+                || !(speed > 0.0 && speed <= NavigationController.MAX_SPEED)
+                || !(turnRate >= CruiseHeading.MIN_RATE && turnRate <= CruiseHeading.MAX_RATE)
+                || target.y < server.getMinBuildHeight() || target.y >= server.getMaxBuildHeight()
+                || !server.getWorldBorder().isWithinBounds(target.x, target.z)) {
+            return NavigationController.Admission.INVALID_TARGET;
+        }
+        TelemetrySnapshot sample = telemetry;
+        if (sample == null) return NavigationController.Admission.UNAVAILABLE;
+        long tick = server.getGameTime();
+        if (remoteManeuver.active(System.nanoTime()) != null) return NavigationController.Admission.BUSY;
+        var running = navigation.active(tick);
+        var request = new NavigationController.Task(id, target.x, target.y, target.z, speed,
+                tick + profile.lifetimeTicks(), profile, turnRate);
+        if (running != null) return navigation.start(request)
+                ? NavigationController.Admission.ACCEPTED : NavigationController.Admission.BUSY;
+        if (profile == NavigationController.Profile.NUDGE) return navigation.start(request)
+                ? NavigationController.Admission.ACCEPTED : NavigationController.Admission.BUSY;
+
+        double distance = sample.position().distanceTo(target);
+        cruiseWitness = null;
+        if (distance > BCConfig.UNSUPERVISED_CRUISE_RANGE.get()
+                && !findCruiseWitness(server, Sable.HELPER.getContaining(this) instanceof ServerSubLevel ship ? ship : null)) {
+            return NavigationController.Admission.NEEDS_CREW;
+        }
+        if (!cruiseChunksLoaded(server, request, sample)) return NavigationController.Admission.ROUTE_UNLOADED;
+        double horizontal = Math.hypot(target.x - sample.position().x, target.z - sample.position().z);
+        double vertical = Math.abs(target.y - sample.position().y);
+        double gearedSpeed = Math.min(speed, TOP_SPEED_BASE * gearMults[gear]);
+        long turnAllowance = horizontal > 0.5 ? (long) Math.ceil(20.0 * Math.PI / turnRate) : 0;
+        long deadline = tick + turnAllowance + Math.max(
+                CruiseRouteWatch.cruiseLifetime(horizontal, gearedSpeed, profile.lifetimeTicks()),
+                CruiseRouteWatch.cruiseLifetime(vertical, tunings.climbRate(), profile.lifetimeTicks()));
+        if (!navigation.start(new NavigationController.Task(id, target.x, target.y, target.z, speed, deadline, profile, turnRate))) {
+            return NavigationController.Admission.BUSY;
+        }
+        cruiseWatch.start(distance, tick);
+        return NavigationController.Admission.ACCEPTED;
+    }
+
+    private boolean findCruiseWitness(ServerLevel level, @Nullable ServerSubLevel ship) {
+        if (ship == null || ship.isRemoved()) return false;
+        var players = level.getServer().getPlayerList();
+        if (cruiseWitness != null && isCruiseWitness(players.getPlayer(cruiseWitness), level, ship)) return true;
+        cruiseWitness = null;
+        int checked = 0;
+        for (UUID tracked : ship.getTrackingPlayers()) {
+            if (++checked > 16) break;
+            if (isCruiseWitness(players.getPlayer(tracked), level, ship)) {
+                cruiseWitness = tracked;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isCruiseWitness(@Nullable ServerPlayer player, ServerLevel level, ServerSubLevel ship) {
+        return player != null && player.level() == level && player.isAlive() && !player.isSpectator()
+                && Sable.HELPER.getTrackingOrVehicleSubLevel(player) == ship;
+    }
+
+    private static boolean cruiseChunksLoaded(ServerLevel level, NavigationController.Task task, TelemetrySnapshot sample) {
+        Vec3 position = sample.position();
+        Vec3 velocity = sample.velocity();
+        double speed = Math.max(task.speed(), Math.hypot(velocity.x, velocity.z));
+        return CruiseRouteWatch.loadedAhead(position.x, position.z, task.x(), task.z(), speed,
+                (x, z) -> level.getChunkSource().getChunkNow(x, z) != null);
+    }
+
+    private void checkCruise(ServerLevel level, @Nullable ServerSubLevel ship, NavigationController.Task task, long tick) {
+        var sample = telemetry;
+        if (sample == null) return;
+        double remaining = sample.position().distanceTo(new Vec3(task.x(), task.y(), task.z()));
+        if (!cruiseChunksLoaded(level, task, sample)) {
+            navigation.finish(task, NavigationController.Phase.ROUTE_UNLOADED);
+        } else if (remaining > BCConfig.UNSUPERVISED_CRUISE_RANGE.get()
+                && cruiseWatch.lostSupervision(findCruiseWitness(level, ship), tick)) {
+            navigation.finish(task, NavigationController.Phase.SUPERVISION_LOST);
+        } else {
+            double headingError = Double.NaN;
+            if (pointingRequest == null) {
+                Direction bow = getBlockState().getValue(BridgeCoreBlock.FACING);
+                headingError = CruiseHeading.turningError(sample.orientation(), bow.getStepX(), bow.getStepZ(),
+                        task.x() - sample.position().x, task.z() - sample.position().z);
+            }
+            if (cruiseWatch.stalled(remaining, headingError, tick)) {
+                navigation.finish(task, NavigationController.Phase.NO_PROGRESS);
+            }
+        }
+    }
+
+    public boolean cancelNavigation(UUID id) { return navigation.cancel(id); }
+
+    public @Nullable NavigationController.Status navigationStatus() { return navigation.status(); }
+
+    private void clearPhysicsSamples() {
+        navigation.finish(NavigationController.Phase.PHYSICS_LOST);
+        remoteManeuver.revoke();
+        telemetry = null;
+        lastPosition.set(null);
+        lastOrientation.set(null);
+        lastLinearVelocity.set(null);
+        lastAngularVelocity.set(null);
+        hasPrevFrameVelocity = false;
+        accelEma.zero();
+        resetHover();
+    }
+
+    private void expirePhysicsSamples(long gameTime) {
+        long gap = physicsWatchdog.pollTimeout(gameTime);
+        if (gap < 0) return;
+
+        clearPhysicsSamples();
+        boolean wasActive = mode != ControlMode.OFF;
+        if (wasActive) setMode(ControlMode.OFF);
+        BridgeCoreMod.LOGGER.warn("[bridgecore] watchdog: no valid physics sample for {} ticks at {}{}",
+                gap, worldPosition, wasActive ? " (mode forced to OFF)" : "");
     }
 
     /** Physics thread: build and publish this frame's telemetry snapshot.
@@ -817,13 +1003,45 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
      *  fire control re-issues at 20 Hz; 500 ms without contact falls back to
      *  OFF + DISCONNECTED (checked in the server ticker, wall clock). One
      *  requester at a time: a later request from a DIFFERENT requester
-     *  overrides (§2.3). mode=OFF releases the active request but keeps the
-     *  link CONNECTED; clearPointing() disconnects fully. */
+     *  overrides and is logged (§2.3). mode=OFF releases the active request
+     *  but keeps the link CONNECTED; clearPointing() disconnects fully. */
     public void requestPointing(UUID requester, PointingMode mode, @Nullable Vec3 posOrDir,
                                 @Nullable UUID targetEntity, double maxAngularRate,
                                 double maxAngularAccel) {
+        requestPointing(requester, mode, posOrDir, targetEntity, null, null, maxAngularRate, maxAngularAccel);
+    }
+
+    public boolean tryRequestAxisPointing(UUID requester, Vec3 bodyAxis, Vec3 direction,
+                                          double maxAngularRate, double maxAngularAccel) {
+        if (mode != ControlMode.STARSHIP || pointingActiveExcept(requester)) return false;
+        requestPointing(requester, PointingMode.POINT_AT_DIR, direction, null, bodyAxis, null, maxAngularRate, maxAngularAccel);
+        return true;
+    }
+
+    public boolean tryRequestAttitudePointing(UUID requester, Quat attitude, double maxAngularRate, double maxAngularAccel) {
+        double norm = attitude.x() * attitude.x() + attitude.y() * attitude.y()
+                + attitude.z() * attitude.z() + attitude.w() * attitude.w();
+        if (mode != ControlMode.STARSHIP || pointingActiveExcept(requester) || Math.abs(norm - 1.0) > 1e-6
+                || !Double.isFinite(norm)) return false;
+        requestPointing(requester, PointingMode.HOLD_ATTITUDE, null, null, null, attitude, maxAngularRate, maxAngularAccel);
+        return true;
+    }
+
+    public boolean attitudePointingSettled(UUID requester) {
+        var active = pointingRequest;
+        var sample = telemetrySnapshot();
+        return active != null && requester.equals(active.requester()) && active.attitude() != null
+                && pointingSettled && sample != null
+                && PointingExecution.withinSettleWindow(PointingExecution.attitudeErrorRad(sample.orientation(), active.attitude()),
+                        sample.angularVelocity().length());
+    }
+
+    private void requestPointing(UUID requester, PointingMode mode, @Nullable Vec3 posOrDir,
+                                 @Nullable UUID targetEntity, @Nullable Vec3 bodyAxis, @Nullable Quat attitude,
+                                 double maxAngularRate, double maxAngularAccel) {
         Objects.requireNonNull(requester, "requester");
         Objects.requireNonNull(mode, "mode");
+        if (mode == PointingMode.HOLD_ATTITUDE && attitude == null) throw new IllegalArgumentException("Missing attitude");
         if (mode == PointingMode.OFF) {
             PointingRequest cur = pointingRequest;
             if (cur != null && cur.requester().equals(requester)) {
@@ -844,9 +1062,26 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
             throw new IllegalArgumentException("pointing limits must be positive: rate="
                     + maxAngularRate + " accel=" + maxAngularAccel);
         }
+        // 2026-11-08 续期幂等（火控 3c 建议采纳）：同 requester + 同模式 + 同
+        // 参数（目标点逐位相等）的 20 Hz 续期只刷新联系时间——不再重置
+        // settled/link，否则 SETTLED 每 tick 被清一次，下游读到的是闪烁。
+        // 目标点变了（如 SHIP 活位置刷新）= 新瞄准请求，照常重置。
+        PointingRequest cur = pointingRequest;
+        if (cur != null && cur.requester().equals(requester) && cur.mode() == mode
+                && sameVec(cur.posOrDir(), posOrDir)
+                && Objects.equals(cur.targetEntity(), targetEntity)
+                && Objects.equals(cur.bodyAxis(), bodyAxis)
+                && Objects.equals(cur.attitude(), attitude)
+                && cur.maxAngularRate() == maxAngularRate
+                && cur.maxAngularAccel() == maxAngularAccel) {
+            pointingRequester = requester;
+            pointingContactNanos = System.nanoTime();
+            return;
+        }
         pointingRequester = requester;
         pointingContactNanos = System.nanoTime();
-        pointingRequest = new PointingRequest(requester, mode, posOrDir, targetEntity,
+        levelAfterPointing.set(false);
+        pointingRequest = new PointingRequest(requester, mode, posOrDir, targetEntity, bodyAxis, attitude,
                 maxAngularRate, maxAngularAccel, pointingContactNanos);
         pointingLink = PointingLinkState.REQUESTING;
         pointingSettled = false; // stays false until execution lands
@@ -854,7 +1089,14 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
 
     /** Full disconnect (interface v1 §2.3). No-op for a non-current requester. */
     public void clearPointing(UUID requester) {
+        clearPointing(requester, false);
+    }
+
+    public void clearPointing(UUID requester, boolean levelOnRelease) {
         if (pointingRequester != null && pointingRequester.equals(requester)) {
+            var active = pointingRequest;
+            levelAfterPointing.set(levelOnRelease && active != null && (active.bodyAxis() != null || active.attitude() != null)
+                    && mode == ControlMode.STARSHIP);
             pointingRequest = null;
             pointingRequester = null;
             pointingLink = PointingLinkState.DISCONNECTED;
@@ -873,6 +1115,116 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
             pointingLink = PointingLinkState.DISCONNECTED;
             pointingSettled = false;
         }
+    }
+
+    /** Vec3 逐位相等（续期幂等用；不依赖 Vec3.equals 是否存在）。 */
+    private static boolean sameVec(@Nullable Vec3 a, @Nullable Vec3 b) {
+        if (a == null || b == null) return a == b;
+        return a.x == b.x && a.y == b.y && a.z == b.z;
+    }
+
+    /** HUD POINT 指示（对表：必做）：有存活指向请求 = 姿态被接管。 */
+    public boolean pointingActive() {
+        return pointingRequest != null;
+    }
+
+    public boolean pointingActiveExcept(@Nullable UUID requester) {
+        var current = pointingRequest;
+        return current != null && !current.requester().equals(requester);
+    }
+
+    /** 轴炮开火闸门读数（对表③）：遥测链现成，这里再给直读入口。 */
+    public PointingLinkState pointingLink() {
+        return pointingLink;
+    }
+
+    /** 指向已就位（SETTLED 持续判定），HUD 指示与遥测用。 */
+    public boolean pointingSettled() {
+        return pointingSettled;
+    }
+
+    /** 导航终端绑定（单一权限集，研究稿 v2 §4）。 */
+    public @Nullable UUID boundTerminalUuid() {
+        return boundTerminalUuid;
+    }
+
+    public void bindTerminal(UUID terminalUuid) {
+        if (level instanceof ServerLevel server) {
+            if (boundTerminalUuid != null && !boundTerminalUuid.equals(terminalUuid)) {
+                NavWakeProbe.untrackBinding(server, getBlockPos(), boundTerminalUuid);
+            }
+            NavWakeProbe.trackBinding(server, this, terminalUuid);
+        }
+        boundTerminalUuid = terminalUuid;
+        setChanged();
+    }
+
+    /** 解绑：仅当请求方就是当前绑定终端时生效。 */
+    public void unbindTerminal(UUID terminalUuid) {
+        if (terminalUuid.equals(boundTerminalUuid)) {
+            clearBoundTerminal();
+        }
+    }
+
+    /** 指令权限：仅绑定终端通过；null 请求方永不通过。 */
+    public boolean terminalAllowed(@Nullable UUID terminalUuid) {
+        return terminalUuid != null && terminalUuid.equals(boundTerminalUuid);
+    }
+
+    /** 核心 GUI 的解绑按钮（操作员动作）：清空绑定，无需终端在场。 */
+    public void clearBoundTerminal() {
+        if (boundTerminalUuid != null && level instanceof ServerLevel server) {
+            NavWakeProbe.untrackBinding(server, getBlockPos(), boundTerminalUuid);
+        }
+        boundTerminalUuid = null;
+        setChanged();
+    }
+
+    /** TRACK_ENTITY 服务端解析（设计 v1.1 §3）：实体中心写入 volatile 缓存；
+     *  实体死亡/卸载 → 释放请求，链路保 CONNECTED（等效 mode=OFF）。 */
+    private void tickPointingTrack(Level level) {
+        PointingRequest req = pointingRequest;
+        if (req == null || req.mode() != PointingMode.TRACK_ENTITY) {
+            pointingTrackPos = null;
+            return;
+        }
+        if (level instanceof net.minecraft.server.level.ServerLevel sl) {
+            net.minecraft.world.entity.Entity e = sl.getEntity(req.targetEntity());
+            if (e != null) {
+                pointingTrackPos = e.position().add(0.0, e.getBbHeight() * 0.5, 0.0);
+                return;
+            }
+        }
+        pointingTrackPos = null;
+        pointingRequest = null;
+        pointingSettled = false;
+        pointingSettleFrames = 0;
+        pointingLink = PointingLinkState.CONNECTED;
+        pointingContactNanos = System.nanoTime();
+    }
+
+    /** 期望船头世界方向（物理帧）：DIR 直读；POS/TRACK 用船逻辑位置现算差。
+     *  目标与船重合等退化情况返回 null。 */
+    private Vector3d pointingDirectionOf(PointingRequest req, Pose3d pose) {
+        Vec3 base = switch (req.mode()) {
+            case POINT_AT_DIR -> {
+                Vec3 d = req.posOrDir();
+                yield d; // 纯方向,直接返回
+            }
+            case POINT_AT_POS -> {
+                var c = pose.position();
+                Vec3 t = req.posOrDir();
+                yield new Vec3(t.x - c.x(), t.y - c.y(), t.z - c.z());
+            }
+            case TRACK_ENTITY -> {
+                Vec3 t = pointingTrackPos;
+                if (t == null) yield null;
+                var c = pose.position();
+                yield new Vec3(t.x - c.x(), t.y - c.y(), t.z - c.z());
+            }
+            default -> null;
+        };
+        return base != null ? new Vector3d(base.x, base.y, base.z) : null;
     }
 
     public double hudOffsetX() {
@@ -1163,12 +1515,10 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
         if (gravityComp) {
             sb.append(String.format(" g=%.4f", DimensionPhysicsData.getGravity(level).length()));
         }
-        long last = lastPhysicsGameTime;
-        boolean live = last != Long.MIN_VALUE && level.getGameTime() - last <= WATCHDOG_TICK_THRESHOLD;
-        if (live) {
+        if (telemetry != null) {
             sb.append(" physics=LIVE(frame ").append(physicsFrames).append(')');
         } else {
-            sb.append(wasPhysicalized ? " physics=STALE(de-physicalized)" : " physics=NEVER");
+            sb.append(physicsWatchdog.wasPhysicalized() ? " physics=STALE" : " physics=NEVER");
         }
         Quaterniond q = lastOrientation.get();
         if (q != null) {
@@ -1204,9 +1554,34 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
     @Override
     public void sable$physicsTick(ServerSubLevel subLevel, RigidBodyHandle handle, double timeStep) {
         physicsFrames++;
-        lastPhysicsGameTime = subLevel.getLevel().getGameTime();
-        wasPhysicalized = true;
-        watchdogTripped = false;
+        long gameTime = subLevel.getLevel().getGameTime();
+        expirePhysicsSamples(gameTime);
+        if (!handle.isValid() || !Double.isFinite(timeStep) || timeStep <= 0.0) {
+            physicsWatchdog.recordInvalid(gameTime);
+            if (telemetry != null) clearPhysicsSamples();
+            return;
+        }
+
+        Pose3d pose = subLevel.logicalPose();
+        Vector3dc omegaWorld = handle.getAngularVelocity(angularVelocity);
+        handle.getLinearVelocity(linVel);
+        var massData = subLevel.getMassTracker();
+        Matrix3dc inertia = massData == null ? null : massData.getInertiaTensor();
+        Vector3dc centerOfMass = massData == null ? null : massData.getCenterOfMass();
+        if (!pose.orientation().isFinite() || !pose.position().isFinite() || !omegaWorld.isFinite()
+                || !linVel.isFinite() || inertia == null || !inertia.isFinite()
+                || centerOfMass == null || !centerOfMass.isFinite() || !Double.isFinite(massData.getMass())) {
+            physicsWatchdog.recordInvalid(gameTime);
+            if (telemetry != null) clearPhysicsSamples();
+            return;
+        }
+
+        boolean continuous = physicsWatchdog.recordValid(gameTime);
+        if (!continuous || subLevel != registeredSubLevel) {
+            clearPhysicsSamples();
+            attitudeTrim.reset();
+            cargoFlight.reset();
+        }
 
         // Keep the CoreDirectory entry current so redstone proxies on the same
         // structure can find us (re-registration is nearly free; the sub-level
@@ -1218,16 +1593,18 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
             telemetryStructureId = structureIdOf(subLevel);
         }
 
-        Pose3d pose = subLevel.logicalPose();
         Quaterniond current = new Quaterniond(pose.orientation());
         lastOrientation.set(current);
         lastPosition.set(new Vector3d(pose.position()));
+        lastAngularVelocity.set(new Vector3d(omegaWorld));
+        lastLinearVelocity.set(new Vector3d(linVel));
 
         // Gear smoothing (M2): slew the thrust multiplier toward the selected gear.
         // Snapshot the config array once per frame (copy-on-write — the GUI may swap
         // the reference mid-frame; the slew target just follows next frame).
         double[] gm = gearMults;
-        double gearDiff = gm[Math.min(gear, gm.length - 1)] - gearMultSmoothed;
+        // R6-1：物理侧同样夹取下限——不只信载入（data merge 可绕过 loadAdditional）。
+        double gearDiff = gm[Math.max(0, Math.min(gear, gm.length - 1))] - gearMultSmoothed;
         double gearStep = GEAR_SLEW_PER_S * timeStep;
         gearMultSmoothed += Math.max(-gearStep, Math.min(gearStep, gearDiff));
         // Control-law tunings: one volatile grab per frame, used by the hover cascade,
@@ -1240,15 +1617,6 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
         // stack, coupled forced ON while the switch is on.
         boolean starshipFamily = activeMode == ControlMode.STARSHIP;
         boolean coupledEff = coupled || (starshipFamily && selfBalance);
-        if (!handle.isValid()) {
-            return;
-        }
-
-        Vector3dc omegaWorld = handle.getAngularVelocity(angularVelocity); // rad/s, world frame
-        Matrix3dc inertia = subLevel.getMassTracker().getInertiaTensor();  // body frame, kg*m^2
-        lastAngularVelocity.set(new Vector3d(omegaWorld));
-        lastLinearVelocity.set(new Vector3d(handle.getLinearVelocity(linVel))); // m/s, world frame
-
         // Telemetry snapshot (interface v1 §1; fire-control request #2): produced
         // on the physics frame, volatile-published, and deliberately BEFORE the
         // OFF early-return — read-only telemetry is exempt from the OFF skip so
@@ -1265,16 +1633,17 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
         if (activeMode == ControlMode.OFF) {
             lastConsumedKeys = keyFaces.get();
             lastConsumedPad = padState.get();
-            hoverTargetY = Double.NaN;
-            wasVerticalInput = false;
-            wasHorizontalInput = false;
-            inputZeroFrames = 0;
-            hoverSettled = false;
-            driftFrames = 0;
+            resetHover();
+            attitudeTrim.reset();
+            cargoFlight.reset();
             stickPitch = 0.0;
             stickRoll = 0.0;
+            navigationWasActive = false;
+            cruiseHeading.clear();
             return;
         }
+        double phase = SubLevelPhysicsSystem.require(subLevel.getLevel()).getPartialPhysicsTick();
+        energyAccount.beginStep(gameTime, Double.doubleToLongBits(phase), timeStep);
 
         // Redstone demand, proxies only (2026-09-18 user ruling: the core body no
         // longer takes redstone — a core sitting next to wiring would eat stray
@@ -1303,7 +1672,7 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
                 shiftGear(-1);
             }
             if (keys.levelNow() && starshipFamily) {
-                engageAutoLevel(pose);
+                engageAutoLevel(pose, false);
             }
         }
         // Gamepad pilot channel (M3a): analog demands compose onto the same body-frame
@@ -1319,7 +1688,7 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
                 shiftGear(-1);
             }
             if (pad.levelEdge() && starshipFamily) {
-                engageAutoLevel(pose);
+                engageAutoLevel(pose, false);
             }
         }
         double rx = (thrustFaces[Direction.EAST.ordinal()] - thrustFaces[Direction.WEST.ordinal()]) / 15.0;
@@ -1333,130 +1702,111 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
             ry = clampUnit(ry + pad.vert());
         }
 
-        // Hover = world-frame vertical control, ONE unified cascade loop:
-        //   outer: position error -> target climb rate;  inner: rate error -> force.
-        //   v_target = climbRate*ry (stick) + hoverKp*(targetY - y) (position),
-        //   F = m*(-g.y + climbKv*(v_target - v_y)),  g queried live per frame,
-        //   all three gains from the per-core Tunings snapshot (config GUI tab 4).
-        // Ground-test findings baked in:
-        //  - Position integrates with a velocity the loop can't see; open-loop gravity
-        //    cancel creeps ~0.13 m/s with v_y reading zero. Closed loops only.
-        //  - Gravity must come from DimensionPhysicsData.getGravity() — sable's
-        //    default is (0,-11,0), NOT 9.8. A hardcoded 10.0 left a 1.0 m/s^2
-        //    deficit: the ship settled at v=-0.13 m/s and every 0.2s stick tap
-        //    LOST 1-2m of altitude (log 2026-09-01 22:59).
-        //  - Stick release captures targetY at the predicted pull-out point, but only
-        //    after a 5-frame zero-input confirm window (v6.1: a one-frame input glitch
-        //    mid-dive once captured a target 38 m low — see handoff §2.8).
-        //  - The coupled auto-brake below must NOT touch the Y axis while hoverOn —
-        //    stacked dampers braked at -8 m/s^2 on release (the "hard yank down").
-        // In STARSHIP, coupled implies hover (user ruling); the stick toggle remains
-        // for decoupled / test-bench use. While hoverOn, the vertical channel is owned
-        // here and excluded from the raw body-frame thrust passthrough below.
+        // Hover owns world Y except during pitch-follow flight. Vertical stick
+        // input always takes precedence over pitch-follow.
+        boolean velocityLoopOn = starshipFamily && coupledEff;
         boolean hoverOn = gravityComp || (starshipFamily && coupledEff);
-        // ry only carries thrust-semantics sources now (translation proxy +
-        // keyboard/gamepad) — no mode gate needed here.
-        boolean verticalInput = ry != 0.0;
-        boolean horizontalInput = rx != 0.0 || rz != 0.0;
-        if (verticalInput || horizontalInput) {
-            inputZeroFrames = 0; // any stick activity resets the release-confirm window
+        boolean followPitch = altitudeFollow && ry == 0.0 && (rx != 0.0 || rz != 0.0);
+        NavigationController.Task navTask = navigation.active(gameTime);
+        RemoteManeuver.Input remoteInput = remoteManeuver.active(System.nanoTime());
+        boolean manual = rx != 0.0 || ry != 0.0 || rz != 0.0 || pad.pitch() != 0.0 || pad.yaw() != 0.0
+                || pad.roll() != 0.0 || axisDemand(torqueFaces, Direction.UP)
+                || axisDemand(torqueFaces, Direction.EAST) || axisDemand(torqueFaces, Direction.SOUTH)
+                || keys.levelNow() || pad.levelEdge();
+        if (manual || remoteInput != null) lastManualFlightInputTick = gameTime;
+        if (navTask != null) {
+            if (!velocityLoopOn || massData.getMass() <= 0.0) {
+                navigation.finish(NavigationController.Phase.MODE_CHANGED);
+                navTask = null;
+            } else if (manual) {
+                navigation.finish(NavigationController.Phase.PILOT_OVERRIDE);
+                navTask = null;
+            }
         }
-        if (hoverOn) {
-            double y = pose.position().y();
-            double mass = subLevel.getMassTracker().getMass();
-            // Live gravity query (sable default (0,-11,0), datapack-overridable):
-            // feed-forward = -g.y, NOT a hardcoded constant.
-            DimensionPhysicsData.getGravity(subLevel.getLevel(), pose.position(), gravityVec);
-            if (verticalInput) {
-                hoverTargetY = y; // follow the stick; release edge captures below
-                wasVerticalInput = true;
-                wasHorizontalInput = false;
-                double vTarget = tune.climbRate() * ry;
-                linForce.set(0.0, mass * (-gravityVec.y + tune.climbKv() * (vTarget - linVel.y)), 0.0);
-            } else if (altitudeFollow && horizontalInput) {
-                // Altitude follow (v6.0): while the pilot drives horizontally with a
-                // pitched hull, the nose-down component is SUPPOSED to cost altitude
-                // (user ground-test: "real" flight converts pitch into climb/dive;
-                // the hard hover lock made every flight perfectly level). Relax the
-                // height lock while horizontal stick is held: only gravity feed-forward
-                // is applied, so the pitch-converted vertical velocity survives.
-                // Release capture below re-locks after the confirm window.
-                hoverTargetY = y;
-                wasHorizontalInput = true;
-                linForce.set(0.0, mass * (-gravityVec.y), 0.0);
-            } else {
-                // Confirmed-release capture (v6.1; legacy-FC pattern "never capture on
-                // a single release edge"): a release edge only ARMS the window — the
-                // target is captured after RELEASE_CONFIRM_FRAMES consecutive zero
-                // frames, using the THEN-current y/v. A one-frame zero (proxy TTL blip,
-                // cross-thread timing) can no longer trigger a capture: the 2026-09-02
-                // mystery descent was a mid-dive capture at y=113/v=-15 that parked the
-                // ship 38 m low (target 74.7 in the log matched the formula exactly).
-                if ((wasVerticalInput || wasHorizontalInput) && inputZeroFrames < RELEASE_CONFIRM_FRAMES) {
-                    inputZeroFrames++;
-                    if (inputZeroFrames == RELEASE_CONFIRM_FRAMES) {
-                        hoverTargetY = y + linVel.y * Math.abs(linVel.y) / (2.0 * PULLOUT_ALPHA);
-                        hoverSettled = false;
-                        wasVerticalInput = false;
-                        wasHorizontalInput = false;
-                    }
-                } else if (Double.isNaN(hoverTargetY)) {
-                    // First arm (hover just switched on): capture immediately.
-                    hoverTargetY = y + linVel.y * Math.abs(linVel.y) / (2.0 * PULLOUT_ALPHA);
-                    hoverSettled = false;
-                } else {
-                    // External-drift re-capture (M3 revision, 2026-09-02 user ruling): once
-                    // SETTLED on the target, being dragged beyond DRIFT_RECAPTURE_M for a
-                    // sustained second means an external actor moved the ship (physics
-                    // staff, another hull) — re-capture here instead of flying back to
-                    // the stale anchor. Armed only after settling, so a deep-dive
-                    // release capture (target up to ~16 m below) completes its pull-out
-                    // undisturbed.
-                    double dyAbs = Math.abs(y - hoverTargetY);
-                    if (dyAbs < SETTLE_M) {
-                        hoverSettled = true;
-                    }
-                    if (hoverSettled && dyAbs > DRIFT_RECAPTURE_M) {
-                        driftFrames++;
-                        if (driftFrames == DRIFT_CONFIRM_FRAMES) {
-                            driftFrames = 0;
-                            hoverSettled = false;
-                            hoverTargetY = y + linVel.y * Math.abs(linVel.y) / (2.0 * PULLOUT_ALPHA);
-                        }
-                    } else {
-                        driftFrames = 0;
-                    }
-                }
-                double vTarget = Double.isNaN(hoverTargetY) ? 0.0 : tune.hoverKp() * (hoverTargetY - y);
-                vTarget = Math.max(-tune.climbRate(), Math.min(tune.climbRate(), vTarget));
-                linForce.set(0.0, mass * (-gravityVec.y + tune.climbKv() * (vTarget - linVel.y)), 0.0);
-            }
-            double fLen = Math.abs(linForce.y);
-            double fMax = mass * HOVER_MAX_ALPHA;
-            if (fLen > fMax) {
-                linForce.y *= fMax / fLen;
-            }
-            double scale = priceWrite(fLen, timeStep, FE_PER_NEWTON_SECOND);
-            if (scale > 0.0) {
-                pose.orientation().transformInverse(linForce.mul(scale));  // -> local frame
-                handle.applyImpulseAtPoint(subLevel.getMassTracker().getCenterOfMass(),
-                        linForce.mul(timeStep));
-            } else if (!Double.isNaN(hoverTargetY)) {
-                // Starve-follow (M3 revision, 2026-09-02 user ruling): with no FE the
-                // hover loop cannot push — drag the target down with the hull so a
-                // refuel hovers IN PLACE instead of climbing back to the pre-crash
-                // capture (the "returns to crash altitude" user observation).
-                hoverTargetY = y;
-                hoverSettled = false;
-                driftFrames = 0;
+        if (remoteInput != null && (!velocityLoopOn || massData.getMass() <= 0.0 || manual || navTask != null)) {
+            remoteManeuver.revoke();
+            remoteInput = null;
+        }
+        RemoteManeuver.Motion remoteMotion = remoteInput == null ? null
+                : resolveRemoteMotion(remoteInput, current, pose, subLevel.getLevel(), TOP_SPEED_BASE * gearMultSmoothed);
+        boolean leavingNavigation = navigationWasActive && navTask == null;
+        if (starshipFamily && leavingNavigation && !keys.levelNow() && !pad.levelEdge()) {
+            starshipAttitudeTarget.set(new Quaterniond(current));
+        }
+        navigationWasActive = navTask != null;
+        if (navTask != null || remoteMotion != null) followPitch = false;
+        double verticalStick = remoteMotion == null ? ry : Math.signum(remoteMotion.y());
+        double hullMass = massData.getMass();
+        if (velocityLoopOn) {
+            if (cargoFlight.update(subLevel, gameTime, pose, massData, linVel)) {
+                resetHover();
+                attitudeTrim.reset();
             }
         } else {
-            hoverTargetY = Double.NaN; // disarm; next hover-on re-captures altitude
-            wasVerticalInput = false;
-            wasHorizontalInput = false;
-            inputZeroFrames = 0;
-            hoverSettled = false;
-            driftFrames = 0;
+            if (cargoFlight.hasDocked()) resetHover();
+            cargoFlight.reset();
+        }
+        boolean dockedCargo = cargoFlight.hasDocked();
+        boolean tetheredCargo = cargoFlight.hasTether();
+        double controlMass = dockedCargo ? cargoFlight.mass() : hullMass;
+        Vector3dc controlCenter = dockedCargo ? cargoFlight.center() : centerOfMass;
+        Vector3dc controlVelocity = dockedCargo ? cargoFlight.velocity() : linVel;
+        boolean precisionNavigation = navTask != null && navTask.profile() == NavigationController.Profile.NUDGE;
+        if (remoteMotion != null) {
+            precisionHover = true;
+        } else if (navTask != null) {
+            precisionHover = precisionNavigation;
+        } else if (ry != 0.0 || followPitch || (leavingNavigation
+                && navigation.status().phase() != NavigationController.Phase.ARRIVED)) {
+            precisionHover = false;
+        }
+        if (!precisionHover) hover.resetHeightSampling();
+        double verticalTolerance = navTask == null ? 0.45 : navTask.profile().verticalTolerance();
+        boolean navigationLiftLimited = false;
+        double navigationVerticalSpeed = linVel.y();
+        if (hoverOn) {
+            if (hullMass > 0.0) {
+                double y = dockedCargo ? cargoFlight.height() : pose.position().y();
+                DimensionPhysicsData.getGravity(subLevel.getLevel(), pose.position(), gravityVec);
+                // Hover spends first. This estimate uses current pool stock and
+                // the same FE rate as the actual write below.
+                double maxThrust = HOVER_MAX_ALPHA * (hullMass / controlMass);
+                double availableThrust = Math.min(maxThrust,
+                        energyAccount.availableForStep() / (controlMass * timeStep * FE_PER_NEWTON_SECOND));
+                double gravity = -gravityVec.y;
+                if (tetheredCargo) cargoFlight.observe(controlVelocity, gravity, maxThrust, verticalStick == 0.0 && !followPitch
+                        && (navTask == null || Math.abs(navTask.y() - pose.position().y()) <= verticalTolerance));
+                double support = tetheredCargo ? gravity + Math.copySign(cargoFlight.verticalSupport(), gravity) : gravity;
+                double response = tetheredCargo ? cargoFlight.verticalResponse(gravity) : 1.0;
+                double verticalSpeed = dockedCargo || tetheredCargo
+                        ? cargoFlight.sampleVerticalSpeed(y, controlVelocity.y(), timeStep) : linVel.y;
+                if (precisionHover) verticalSpeed = hover.sampleHeightSpeed(y, verticalSpeed, timeStep);
+                navigationVerticalSpeed = dockedCargo && !precisionNavigation ? linVel.y() : verticalSpeed;
+                navigationLiftLimited = availableThrust < Math.abs(support)
+                        || (navTask != null && Math.abs(navTask.y() - pose.position().y()) > verticalTolerance
+                        && availableThrust < Math.abs(support) + 0.05);
+                hoverVerticalInput = verticalStick != 0.0;
+                if (leavingNavigation && ry == 0.0 && !followPitch) hover.captureHeight(y);
+                double externalHeight = navTask == null ? Double.NaN : navTask.y() + (y - pose.position().y());
+                double climbRate = precisionNavigation ? Math.min(tune.climbRate(), navTask.speed()) : tune.climbRate();
+                if (remoteMotion != null && verticalStick != 0.0) climbRate = Math.abs(remoteMotion.y());
+                double acceleration = hover.thrustAcceleration(y, verticalSpeed, verticalStick, followPitch,
+                        support, availableThrust, timeStep, tune.hoverKp(), tune.climbKv(), climbRate,
+                        response, externalHeight);
+                double force = controlMass * Math.clamp(acceleration, -maxThrust, maxThrust);
+                double scale = priceWrite(Math.abs(force), timeStep, FE_PER_NEWTON_SECOND);
+                if (scale > 0.0) {
+                    double impulseY = force * scale * timeStep;
+                    if (tetheredCargo) cargoFlight.recordHoverImpulse(impulseY);
+                    linForce.set(0.0, impulseY, 0.0);
+                    pose.orientation().transformInverse(linForce);
+                    handle.applyImpulseAtPoint(controlCenter, linForce);
+                }
+            } else {
+                resetHover();
+            }
+        } else {
+            resetHover();
         }
 
         // Redstone passthrough application (direct write; §8 step 2 torque /
@@ -1473,15 +1823,13 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
         // translation (demanded axes included), so the raw passthrough is skipped
         // there; the M2 soft speed cap (speedCapped/hysteresis) is deleted with it —
         // the velocity loop's top-speed target is the limiter now.
-        boolean velocityLoopOn = starshipFamily && coupledEff;
         if (!velocityLoopOn && (rx != 0.0 || ry != 0.0 || rz != 0.0)) {
             double mass = subLevel.getMassTracker().getMass();
             linearImpulse.set(rx, hoverOn ? 0.0 : ry, rz);
             linearImpulse.mul(mass * THRUST_ACCEL * gearMultSmoothed);  // N
             double scale = priceWrite(linearImpulse.length(), timeStep, FE_PER_NEWTON_SECOND);
             if (scale > 0.0) {
-                handle.applyImpulseAtPoint(subLevel.getMassTracker().getCenterOfMass(),
-                        linearImpulse.mul(scale * timeStep));
+                handle.applyImpulseAtPoint(centerOfMass, linearImpulse.mul(scale * timeStep));
             }
         }
         // Attitude channel. In STARSHIP the faces are a RATE COMMAND (M1: stick ->
@@ -1539,13 +1887,49 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
             }
         }
 
+        PointingRequest preq = pointingRequest;
+        if (preq != null && preq.attitude() != null && (manual || remoteInput != null)) {
+            preq = null;
+            pointingSettled = false;
+        }
+        if (navTask != null && navTask.profile() == NavigationController.Profile.CRUISE) {
+            Direction bow = getBlockState().getValue(BridgeCoreBlock.FACING);
+            cruiseHeading.update(navTask, pose.position().x(), pose.position().z(), bow.getStepX(), bow.getStepZ());
+        } else {
+            cruiseHeading.clear();
+        }
+        var courseAttitude = preq == null ? cruiseHeading.target() : null;
+        boolean cruiseFacing = courseAttitude != null;
         // ---- starship translation layer (handoff §8 step 5) ----
         // World-frame force accumulator: the unified target-velocity loop (v6.0).
         // Priced per newton-second like all writes. (OFF returned above.)
         if (starshipFamily) {
-            double mass = subLevel.getMassTracker().getMass();
             linForce.set(0.0, 0.0, 0.0);
-            if (coupledEff) {
+            double fMax = hullMass * Math.max(MAX_LIN_ALPHA, THRUST_ACCEL * gearMultSmoothed);
+            if (navTask != null) {
+                double availableForce = Math.min(fMax,
+                        energyAccount.availableForStep() / (timeStep * FE_PER_NEWTON_SECOND));
+                double brakeMass = controlMass * (tetheredCargo ? 1.0 + cargoFlight.horizontalRatio() : 1.0);
+                double alignment = cruiseFacing ? cruiseHeading.speedFactor(current) : 1.0;
+                double speedLimit = Math.min(navTask.speed(), TOP_SPEED_BASE * gearMultSmoothed);
+                if (navTask.profile() == NavigationController.Profile.CRUISE
+                        && speedLimit > CruiseRouteWatch.FAST_SPEED_THRESHOLD) {
+                    speedLimit = Math.min(speedLimit, CruiseRouteWatch.fastSpeedLimit(Math.min(24.0, availableForce / brakeMass)));
+                }
+                NavigationController.Guidance guide = navigation.guide(navTask, timeStep,
+                        pose.position().x(), pose.position().y(), pose.position().z(),
+                        linVel.x(), navigationVerticalSpeed, linVel.z(), availableForce / brakeMass,
+                        speedLimit * alignment, navigationLiftLimited);
+                linForce.set(guide.vx() - controlVelocity.x(), 0.0, guide.vz() - controlVelocity.z())
+                        .mul(controlMass * tune.transKv());
+                pose.orientation().transformInverse(vTargetBody.set(guide.vx(), 0.0, guide.vz()));
+            } else if (remoteMotion != null) {
+                double vx = navigationLiftLimited ? 0.0 : remoteMotion.x();
+                double vz = navigationLiftLimited ? 0.0 : remoteMotion.z();
+                linForce.set(vx - controlVelocity.x(), 0.0, vz - controlVelocity.z())
+                        .mul(controlMass * tune.transKv());
+                pose.orientation().transformInverse(vTargetBody.set(vx, 0.0, vz));
+            } else if (coupledEff) {
                 // Unified target-velocity loop (v6.0), per body axis:
                 //   F = m * transKv * (v_target - v),  v_target = stick * topSpeed.
                 // One loop subsumes three v5.x mechanisms:
@@ -1570,18 +1954,18 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
                 // the X axis alone (log 19:11:34: pitch held -26.5 deg, v.y only
                 // reached -5.4 of the expected -10.7 m/s). So while altitude-follow
                 // stick flight is active the loop takes body-Y back (target 0 = track
-                // follows the nose plane). Vertical stick (verticalInput) still hands
+                // follows the nose plane). Vertical stick still hands
                 // the channel to the hover climb loop.
-                boolean loopOwnsBodyY = !hoverOn || (altitudeFollow && horizontalInput && !verticalInput);
+                boolean loopOwnsBodyY = !hoverOn || followPitch;
                 double topSpeed = TOP_SPEED_BASE * gearMultSmoothed;
                 vTargetBody.set(rx * topSpeed, ry * topSpeed, rz * topSpeed);
                 if (loopOwnsBodyY) {
-                    pose.orientation().transformInverse(linVel, vBody); // world -> body
+                    pose.orientation().transformInverse(controlVelocity, vBody); // world -> body
                     latBody.set(tune.transKv() * (vTargetBody.x - vBody.x),
                             tune.transKv() * (vTargetBody.y - vBody.y),
                             tune.transKv() * (vTargetBody.z - vBody.z));
                     pose.orientation().transform(latBody);          // body -> world
-                    linForce.add(latBody.mul(mass));
+                    linForce.add(latBody.mul(controlMass));
                 } else {
                     // Hover owns the vertical: damp WORLD-horizontal velocity
                     // toward the horizontal part of the stick target, not the
@@ -1599,37 +1983,60 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
                     latBody.set(rx * topSpeed, 0.0, rz * topSpeed);
                     pose.orientation().transform(latBody); // stick target -> world
                     latBody.y = 0.0;
-                    linForce.add(mass * tune.transKv() * (latBody.x - linVel.x),
-                            0.0, mass * tune.transKv() * (latBody.z - linVel.z));
+                    linForce.add(controlMass * tune.transKv() * (latBody.x - controlVelocity.x()),
+                            0.0, controlMass * tune.transKv() * (latBody.z - controlVelocity.z()));
                 }
             } else {
                 vTargetBody.set(Double.NaN, Double.NaN, Double.NaN);
+            }
+            if (tetheredCargo) {
+                double massScale = 1.0 + cargoFlight.horizontalRatio();
+                linForce.mul(massScale, 1.0, massScale);
+                cargoFlight.slewHorizontalForce(linForce, hullMass, timeStep);
             }
             double fLen = linForce.length();
             if (fLen > 0.0) {
                 // Force ceiling scales with the gear's own thrust authority so the
                 // loop can actually reach top speed at high gears (G4 = 24 m/s^2 —
                 // brakes bite hard there; player-facing tunables land in the UI later).
-                double fMax = mass * Math.max(MAX_LIN_ALPHA, THRUST_ACCEL * gearMultSmoothed);
                 if (fLen > fMax) {
                     linForce.mul(fMax / fLen);
                 }
                 double scale = priceWrite(linForce.length(), timeStep, FE_PER_NEWTON_SECOND);
                 if (scale > 0.0) {
+                    if (navTask != null) navigation.recordBrake(navTask, linVel.x(), linVel.z(),
+                            linForce.x() * scale * timeStep, linForce.z() * scale * timeStep, timeStep);
+                    if (tetheredCargo) cargoFlight.recordVelocityImpulse(linForce, scale * timeStep);
                     pose.orientation().transformInverse(linForce.mul(scale)); // world -> local
-                    handle.applyImpulseAtPoint(subLevel.getMassTracker().getCenterOfMass(),
-                            linForce.mul(timeStep));
+                    handle.applyImpulseAtPoint(controlCenter, linForce.mul(timeStep));
                 }
             }
         }
+        if (tetheredCargo) cargoFlight.finish(controlVelocity, controlMass, timeStep);
 
         // Attitude authority. STARSHIP runs a RATE loop while the attitude stick is
         // held. Release-edge capture splits on the selfBalance switch (M3 revision,
         // 2026-09-02 user ruling): plain STARSHIP holds the FULL attitude (on-demand
         // leveling is the C key); selfBalance auto-levels (yaw-hold, pitch/roll -> 0,
-        // near-vertical bow falls back to full capture). No input yet = pure damping
-        // (pre-M1 baseline behavior). DAMPING, the only other active mode, is pure
-        // KD damping.
+        // near-vertical bow falls back to full capture). A fresh STARSHIP captures
+        // its current attitude on the first valid frame without a rate command.
+        // 指向释放当帧：以当前姿态重捕获 HOLD 目标——否则旧目标会把船拉回
+        // 指向开始前的姿态（回弹）。
+        if (preq == null && starshipFamily) {
+            if (pointingWasActive && !keys.levelNow() && !pad.levelEdge()) {
+                starshipAttitudeTarget.set(new Quaterniond(current));
+            }
+            if (levelAfterPointing.get() && levelAfterPointing.getAndSet(false)
+                    && !manual && remoteMotion == null && navTask == null) {
+                engageAutoLevel(pose, true);
+            }
+        }
+        pointingWasActive = preq != null;
+        boolean remoteYaw = remoteMotion != null && remoteMotion.yaw() != 0.0 && preq == null;
+        if (remoteYaw) {
+            current.transformInverse(omegaTargetBody.set(0.0, remoteMotion.yaw(), 0.0));
+            rateCommand = true;
+        }
         AttitudeController.Mode attMode;
         Quaterniond attTarget;
         if (starshipFamily) {
@@ -1660,21 +2067,100 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
                     }
                 }
                 attTarget = starshipAttitudeTarget.get();
-                attMode = attTarget != null ? AttitudeController.Mode.HOLD : AttitudeController.Mode.DAMPING;
+                if (attTarget == null) {
+                    attTarget = new Quaterniond(current);
+                    starshipAttitudeTarget.set(attTarget);
+                }
+                attMode = AttitudeController.Mode.HOLD;
             }
         } else {
             attMode = AttitudeController.Mode.DAMPING;
             attTarget = null;
         }
-        AttitudeController.computeTorque(attMode, current, attTarget,
-                rateCommand ? omegaTargetBody : null, omegaWorld, inertia, torque,
-                tune.attitudeKp(), tune.attitudeKd(), tune.attMaxAlpha());
+        // Pointing execution (design v1.1, 2026-11-08): an active request owns
+        // the attitude loop. Per-frame shortest-arc target (roll free), RATE-form
+        // command = clamp(kp·|e|, maxAngularRate), accel clamp additionally
+        // capped by the request's maxAngularAccel. Pilot stick input does NOT
+        // break the link (§5 user ruling). Translation/hover untouched.
+        Vector3d pointingOmega = null;
+        double attMaxAlphaEff = remoteYaw ? Math.min(tune.attMaxAlpha(), RemoteManeuver.YAW_ACCELERATION)
+                : tune.attMaxAlpha();
+        if (preq != null && starshipFamily) {
+            Vector3d dirW = pointingDirectionOf(preq, pose);
+            Direction bowDir = getBlockState().getValue(BridgeCoreBlock.FACING);
+            Vec3 bodyAxis = preq.bodyAxis();
+            Vector3d bowLocal = bodyAxis == null
+                    ? new Vector3d(bowDir.getStepX(), bowDir.getStepY(), bowDir.getStepZ())
+                    : new Vector3d(bodyAxis.x, bodyAxis.y, bodyAxis.z);
+            Quat attitude = preq.attitude();
+            if (!Objects.equals(attitude, pointingSettleTarget)) {
+                pointingSettleFrames = 0;
+                pointingSettleTarget = attitude;
+            }
+            Quaterniond qt = attitude != null ? new Quaterniond(attitude.x(), attitude.y(), attitude.z(), attitude.w())
+                    : dirW != null ? PointingExecution.shortestArcTarget(current, bowLocal, dirW) : null;
+            if (qt != null) {
+                pointingOmega = PointingExecution.rateCommand(current, qt,
+                        tune.attitudeKp(), preq.maxAngularRate(), new Vector3d());
+                attMode = AttitudeController.Mode.RATE;
+                attTarget = null;
+                attMaxAlphaEff = Math.min(tune.attMaxAlpha(), preq.maxAngularAccel());
+                double error = attitude != null ? PointingExecution.attitudeErrorRad(current, attitude)
+                        : PointingExecution.bowErrorRad(current, bowLocal, dirW);
+                pointingSettleFrames = PointingExecution.nextSettleFrames(pointingSettleFrames, error, omegaWorld.length());
+                boolean settledNow = pointingSettleFrames >= PointingExecution.SETTLED_FRAMES;
+                pointingSettled = settledNow;
+                pointingLink = settledNow ? PointingLinkState.SETTLED : PointingLinkState.REQUESTING;
+            } else {
+                pointingSettleFrames = 0;
+                pointingSettled = false;
+            }
+        } else {
+            pointingSettleFrames = 0;
+            pointingSettleTarget = null;
+        }
+        if (cruiseFacing) {
+            PointingExecution.rateCommand(current, courseAttitude, tune.attitudeKp(), navTask.turnRate(), omegaTargetBody);
+            attMode = AttitudeController.Mode.RATE;
+            attTarget = null;
+            attMaxAlphaEff = Math.min(attMaxAlphaEff, CruiseHeading.MAX_ACCELERATION);
+        }
+        Vector3d omegaCmd = pointingOmega != null ? pointingOmega
+                : rateCommand || cruiseFacing ? omegaTargetBody : null;
+        AttitudeController.computeAngularAcceleration(attMode, current, attTarget,
+                omegaCmd, omegaWorld, angularAcceleration,
+                tune.attitudeKp(), tune.attitudeKd());
+        boolean trackAttitudeLoad = attTarget != null || omegaCmd != null;
+        if (trackAttitudeLoad) {
+            attitudeTrim.addCorrection(attTarget, current, omegaWorld, controlMass,
+                    attMaxAlphaEff, angularAcceleration);
+        }
+        if (remoteYaw && pointingOmega == null) {
+            current.transform(angularAcceleration);
+            angularAcceleration.y = RemoteManeuver.limitYawAcceleration(angularAcceleration.y, omegaWorld.y(), timeStep);
+            current.transformInverse(angularAcceleration);
+        }
+        boolean saturated = AttitudeController.limitAngularAcceleration(angularAcceleration, attMaxAlphaEff);
+        (dockedCargo ? cargoFlight.inertia() : inertia).transform(angularAcceleration, torque);
+        double scale = 1.0;
         if (torque.lengthSquared() > 0.0) {
-            double scale = priceWrite(torque.length(), timeStep,
+            scale = priceWrite(torque.length(), timeStep,
                     FE_PER_NM_SECOND * tune.rotPriceMult());
             if (scale > 0.0) {
                 handle.applyAngularImpulse(angularImpulse.set(torque).mul(scale * timeStep));
             }
+        }
+        if (trackAttitudeLoad && !saturated && scale == 1.0) {
+            if (dockedCargo) {
+                // The solver shares the root's impulse with the docked bodies.
+                // Use the predicted group response as the observer baseline.
+                current.transform(angularAcceleration, omegaAfterAttitudeWrite).mul(timeStep).add(omegaWorld);
+            } else {
+                handle.getAngularVelocity(omegaAfterAttitudeWrite);
+            }
+            attitudeTrim.recordAfterWrite(omegaAfterAttitudeWrite, timeStep);
+        } else {
+            attitudeTrim.reset();
         }
 
     }
@@ -1694,23 +2180,14 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
         be.energyAccount.rebind(sub);
         double spent = be.energyAccount.drainSpent();
         be.drawFePerTick += (spent - be.drawFePerTick) * DRAW_SMOOTH_ALPHA;
-        // END estimate (CC channel; the HUD screen runs the same estimator): the
-        // stock is pools + extractor buffers + the burnable remainder.
-        double stock = be.energyAccount.totalStored();
-        if (sub != null) {
-            for (EnergyExtractorBlockEntity ex : CoreDirectory.extractorsOf(sub)) {
-                stock += ex.buffer() + ex.potentialFe();
-            }
-        }
-        be.enduranceSeconds = be.endurance.update(stock, be.drawFePerTick, level.getGameTime());
         // Legacy migration: pre-v0.13 saves stored a core-local buffer under "fe";
-        // pour it back into the pools once, void what does not fit.
+        // transfer it once, preserving any balance above the new capacity.
         if (be.pendingLegacyFe >= 0) {
             if (be.energyAccount.hasPools()) {
-                long restored = be.energyAccount.fillExternal(be.pendingLegacyFe);
+                long restored = be.energyAccount.restoreLegacy(be.pendingLegacyFe);
                 long voided = be.pendingLegacyFe - restored;
                 BridgeCoreMod.LOGGER.warn("[bridgecore] legacy core buffer at {}: {} FE restored to pools"
-                        + (voided > 0 ? ", " + voided + " FE voided (pools full)" : ""), pos, restored);
+                        + (voided > 0 ? ", " + voided + " FE exceeded storage range" : ""), pos, restored);
                 be.pendingLegacyFe = -1;
             } else if (++be.legacyFlushWait >= 20) {
                 if (be.pendingLegacyFe > 0) {
@@ -1720,6 +2197,7 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
                 be.pendingLegacyFe = -1;
             }
         }
+        be.energyAccount.updateStatus(be.drawFePerTick, level.getGameTime());
         // Keyboard pilot channel (M3k): poll the Linked Typewriter on the same tick.
         // Pairing metric = the gamepad ruling (ShipPairing): on a structure the
         // typewriter pairs against the structure's SHIPYARD-space bounding box
@@ -1782,6 +2260,7 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
 
         // Pointing link watchdog (interface v1 §2.3): 500 ms renewal timeout.
         be.tickPointingLink();
+        be.tickPointingTrack(level);
 
         // HUD calibration re-assert (server thread): displays keep their own persisted
         // calib and self-adopt on (re)join, but a display that was already on the
@@ -1803,30 +2282,24 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
             be.calibPushedSub = null;
         }
 
-        if (be.lastPhysicsGameTime == Long.MIN_VALUE) {
-            if (!be.wasPhysicalized) {
-                return; // never physicalized — nothing to watch
+        be.expirePhysicsSamples(level.getGameTime());
+        var remote = be.remoteManeuver.active(System.nanoTime());
+        if (remote != null && level instanceof ServerLevel server) {
+            var owner = remote.owner();
+            var pilot = server.getServer().getPlayerList().getPlayer(owner.player());
+            var held = pilot == null ? null : NavTerminalData.heldTerminal(pilot, owner.terminal());
+            if (held == null || pilot.level() != server || !pilot.isAlive() || pilot.isSpectator()
+                    || !be.terminalAllowed(owner.terminal()) || !pos.equals(NavTerminalData.boundCorePos(held))
+                    || !server.dimension().location().equals(NavTerminalData.boundCoreDim(held))) {
+                be.remoteManeuver.revoke();
             }
-            // BE rebuilt after de-physicalization: runtime state was wiped, but NBT says
-            // this block was on a structure before. Re-arm at "now" so the watchdog
-            // fires if no new physics frames arrive within the threshold.
-            be.lastPhysicsGameTime = level.getGameTime();
         }
-        long last = be.lastPhysicsGameTime;
-        long gap = level.getGameTime() - last;
-        if (gap > WATCHDOG_TICK_THRESHOLD && !be.watchdogTripped) {
-            be.watchdogTripped = true;
-            if (be.mode != ControlMode.OFF) {
-                be.mode = ControlMode.OFF;
-                BridgeCoreMod.LOGGER.warn(
-                        "[bridgecore] watchdog: no physics frame for {} ticks at {} — structure "
-                                + "de-physicalized, mode forced to OFF (safe state)",
-                        gap, pos);
-            } else {
-                BridgeCoreMod.LOGGER.warn(
-                        "[bridgecore] watchdog: no physics frame for {} ticks at {} (structure de-physicalized)",
-                        gap, pos);
-            }
+        long tick = level.getGameTime();
+        var navigationTask = be.navigation.active(tick);
+        if (navigationTask != null && navigationTask.profile() == NavigationController.Profile.CRUISE
+                && level instanceof ServerLevel server
+                && Math.floorMod(tick + pos.hashCode(), CruiseRouteWatch.CHECK_INTERVAL) == 0) {
+            be.checkCruise(server, sub, navigationTask, tick);
         }
     }
 
@@ -1873,6 +2346,7 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
     public void setRemoved() {
         CoreDirectory.deregister(registeredSubLevel, this);
         registeredSubLevel = null;
+        clearPhysicsSamples();
         super.setRemoved();
     }
 
@@ -1881,7 +2355,7 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
     @Override
     protected void saveAdditional(CompoundTag tag, HolderLookup.Provider registries) {
         super.saveAdditional(tag, registries);
-        tag.putBoolean("wasPhysicalized", wasPhysicalized || lastPhysicsGameTime != Long.MIN_VALUE);
+        tag.putBoolean("wasPhysicalized", physicsWatchdog.wasPhysicalized());
         tag.putInt("gear", gear);
         // Interaction state (2026-09-02 "kbd=OFF" lesson): switches that silently reset
         // across a restart look like broken controls — persist all of them.
@@ -1923,6 +2397,9 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
         }
         // §2.29: 结构级 Tab 档位（-1=OFF..3），屏不再自持。
         tag.putInt("hudLockCategory", hudLockCategory);
+        if (boundTerminalUuid != null) {
+            tag.putUUID("boundTerminal", boundTerminalUuid);
+        }
         // NBT has no double-array tag type -> ListTag of DoubleTag under one key.
         ListTag tuneTag = new ListTag();
         for (double v : tunings.toArray()) {
@@ -1937,7 +2414,7 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
         // Independent of calibration schema. Missing key preserves the
         // current value (new instances default ON; partial loads do not reset it).
         if (tag.contains("hudOutline")) hudOutline = tag.getBoolean("hudOutline");
-        wasPhysicalized = tag.getBoolean("wasPhysicalized");
+        physicsWatchdog.restorePhysicalized(tag.getBoolean("wasPhysicalized"));
         // Pre-v0.13 saves stored a core-local FE buffer; v0.13 spends straight from
         // the pools, so the leftover is poured back into them on a server tick.
         if (tag.contains("fe")) {
@@ -1946,42 +2423,64 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
         // Config state first: the gear snap below reads gearMults.
         if (tag.contains("gearMults")) {
             int[] raw = tag.getIntArray("gearMults");
-            if (raw.length == GEAR_COUNT) {
-                double[] gm = new double[GEAR_COUNT];
-                for (int i = 0; i < GEAR_COUNT; i++) {
-                    gm[i] = Math.max(GEAR_MULT_MIN, Math.min(GEAR_MULT_MAX, raw[i] / 1000.0));
-                }
-                gearMults = gm;
+            // R7-3：长度不符不做整组丢弃——前缀覆盖 + 其余保留默认/现值。
+            if (raw.length != GEAR_COUNT) {
+                BridgeCoreMod.LOGGER.warn("[bridgecore] gearMults length {} != {}, prefix overlay",
+                        raw.length, GEAR_COUNT);
             }
+            double[] next = gearMults.clone();
+            for (int i = 0; i < Math.min(raw.length, GEAR_COUNT); i++) {
+                next[i] = Math.max(GEAR_MULT_MIN, Math.min(GEAR_MULT_MAX, raw[i] / 1000.0));
+            }
+            gearMults = next;
         }
         if (tag.contains("keyMap")) {
             int[] raw = tag.getIntArray("keyMap");
             if (raw.length == TypewriterInput.CHANNEL_COUNT) {
                 keyMap = raw;
-            } else if (raw.length < TypewriterInput.CHANNEL_COUNT && raw.length >= 15) {
+            } else if (raw.length < TypewriterInput.CHANNEL_COUNT) {
                 // Shorter saves predate newer channels (lock_category at 15,
                 // lock_species at 16, lock_release at 17, channel_cycle at 18,
                 // fire at 19) — adopt the stored binds and take the new
                 // channels' factory defaults (Tab, V, G, X, H).
+                // R7-3 残留：长度 <15 的旧档也走这条路（此前整组回默认）。
                 int[] grown = TypewriterInput.defaultKeyMap();
                 System.arraycopy(raw, 0, grown, 0, raw.length);
                 keyMap = grown;
+                // R7-4：玩法相关的迁移留日志。
+                BridgeCoreMod.LOGGER.warn("[bridgecore] keyMap migrated at {}: {} -> {} channels",
+                        getBlockPos().toShortString(), raw.length, TypewriterInput.CHANNEL_COUNT);
+            } else if (raw.length > TypewriterInput.CHANNEL_COUNT) {
+                // R7-3：未来版本的更长 keyMap 也做前缀覆盖（不是整组丢弃）。
+                BridgeCoreMod.LOGGER.warn("[bridgecore] keyMap length {} > {}, prefix overlay",
+                        raw.length, TypewriterInput.CHANNEL_COUNT);
+                int[] next = keyMap.clone();
+                System.arraycopy(raw, 0, next, 0, TypewriterInput.CHANNEL_COUNT);
+                keyMap = next;
             }
         }
         if (tag.contains("gamepadMap")) {
             int[] raw = tag.getIntArray("gamepadMap");
-            if (raw.length == GamepadInput.MAP_LENGTH) {
-                gamepadMap = raw;
+            // R7-3：同 gearMults——前缀覆盖，不整组丢弃。
+            if (raw.length != GamepadInput.MAP_LENGTH) {
+                BridgeCoreMod.LOGGER.warn("[bridgecore] gamepadMap length {} != {}, prefix overlay",
+                        raw.length, GamepadInput.MAP_LENGTH);
             }
+            int[] next = gamepadMap.clone();
+            System.arraycopy(raw, 0, next, 0, Math.min(raw.length, next.length));
+            gamepadMap = next;
         }
         if (tag.contains("hudScale")) {
-            double hx = tag.getDouble("hudX");
-            double hy = tag.getDouble("hudY");
-            double hs = tag.getDouble("hudScale");
+            // R7-5：双精度载入统一有限性闸门（Math.min/max 拦不住 NaN/Inf）。
+            double hx = NbtGuards.finiteOr(tag.getDouble("hudX"), 0.0);
+            double hy = NbtGuards.finiteOr(tag.getDouble("hudY"), 0.0);
+            double hs = NbtGuards.finiteOr(tag.getDouble("hudScale"), 1.0);
             // Pre-2.14 saves may predate the eye keys entirely: the migration
             // below treats them as the old defaults (2.0 / 0.12).
-            double hex = tag.contains("hudEyeX") ? tag.getDouble("hudEyeX") : 2.0;
-            double hey = tag.contains("hudEyeY") ? tag.getDouble("hudEyeY") : 0.12;
+            double hex = tag.contains("hudEyeX")
+                    ? NbtGuards.finiteOr(tag.getDouble("hudEyeX"), 2.0) : 2.0;
+            double hey = tag.contains("hudEyeY")
+                    ? NbtGuards.finiteOr(tag.getDouble("hudEyeY"), 0.12) : 0.12;
             if (!tag.getBoolean("hudCalibV2")) {
                 // 2026-10-26 v1 -> v2 calibration migration. DIRECT field write,
                 // deliberately bypassing the setHudCalib clamps so extreme
@@ -2012,11 +2511,14 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
                 hudEyeY = (1.1 + oldAnchorHalf) - com.bridgecore.display.HudLockBoxLayer.EYE_BASE_Y;
                 // The remaining params take the same clamps as setHudCalib.
                 hudPitchStep = Math.max(HUD_PITCH_STEP_MIN, Math.min(HUD_PITCH_STEP_MAX,
-                        tag.contains("hudPitchStep") ? tag.getDouble("hudPitchStep") : 5.0));
+                        tag.contains("hudPitchStep")
+                                ? NbtGuards.finiteOr(tag.getDouble("hudPitchStep"), 5.0) : 5.0));
                 hudAttSize = Math.max(HUD_ATT_SIZE_MIN, Math.min(HUD_ATT_SIZE_MAX,
-                        tag.contains("hudAttSize") ? tag.getDouble("hudAttSize") : 1.0));
+                        tag.contains("hudAttSize")
+                                ? NbtGuards.finiteOr(tag.getDouble("hudAttSize"), 1.0) : 1.0));
                 hudAttBorder = Math.max(0.0, Math.min(HUD_ATT_BORDER_MAX,
-                        tag.contains("hudAttBorder") ? tag.getDouble("hudAttBorder") : 0.0));
+                        tag.contains("hudAttBorder")
+                                ? NbtGuards.finiteOr(tag.getDouble("hudAttBorder"), 0.0) : 0.0));
                 hudInputLine = !tag.contains("hudInputLine") || tag.getBoolean("hudInputLine");
                 hudLockRange = Math.max(HUD_LOCK_RANGE_MIN, Math.min(HUD_LOCK_RANGE_MAX,
                         tag.contains("hudLockRange") ? tag.getInt("hudLockRange")
@@ -2027,6 +2529,9 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
                 hudLockMaxCount = Math.max(HUD_LOCK_MAX_COUNT_MIN, Math.min(HUD_LOCK_MAX_COUNT_MAX,
                         tag.contains("hudLockMaxCount") ? tag.getInt("hudLockMaxCount")
                                 : HUD_LOCK_MAX_COUNT_DEFAULT));
+                // R7-4：v1→v2 校准迁移留日志（影响观感的迁移必须可见）。
+                BridgeCoreMod.LOGGER.warn("[bridgecore] HUD calibration migrated v1->v2 at {}",
+                        getBlockPos().toShortString());
             } else {
                 setHudCalib(hx, hy, hs, hex, hey,
                         tag.contains("hudPitchStep") ? tag.getDouble("hudPitchStep") : 5.0,
@@ -2047,6 +2552,7 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
             hudLockCategory = Math.max(HudScreenBlockEntity.LOCK_NOTCH_OFF,
                     Math.min(3, tag.getInt("hudLockCategory")));
         }
+        boundTerminalUuid = NbtGuards.hasUuid4(tag, "boundTerminal") ? tag.getUUID("boundTerminal") : null;
         hudLockSpecies = tag.contains("hudLockSpecies")
                 ? tag.getString("hudLockSpecies") : null;
         if (tag.contains("tunings")) {
@@ -2064,7 +2570,8 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
             }
         }
         if (tag.contains("gear")) {
-            gear = Math.min(tag.getInt("gear"), gearMults.length - 1);
+            // R6-1：负 gear 也要夹（此前只夹上限，脏 NBT 直接 AIOOBE）。
+            gear = Math.max(0, Math.min(tag.getInt("gear"), gearMults.length - 1));
             gearMultSmoothed = gearMults[gear]; // snap on load; no slew across a world reload
         }
         // Merge-style load (handoff §5.6 pattern): missing keys keep the field defaults.
@@ -2085,6 +2592,9 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
                     try {
                         mode = ControlMode.valueOf(saved);
                     } catch (IllegalArgumentException e) {
+                        // R7-3 残留：未知 mode 回退也要留日志。
+                        BridgeCoreMod.LOGGER.warn("[bridgecore] unknown control mode '{}' at {} -> OFF",
+                                saved, getBlockPos().toShortString());
                         mode = ControlMode.OFF;
                     }
                 }
@@ -2121,18 +2631,47 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
         return Math.max(-1.0, Math.min(1.0, v));
     }
 
+    private static boolean axisDemand(int[] faces, Direction direction) {
+        return faces[direction.ordinal()] != faces[direction.getOpposite().ordinal()];
+    }
+
+    private RemoteManeuver.Motion resolveRemoteMotion(RemoteManeuver.Input input, Quaterniond orientation,
+                                                      Pose3d pose, ServerLevel level, double speedLimit) {
+        Direction facing = getBlockState().getValue(BridgeCoreBlock.FACING);
+        Vector3d bow = new Vector3d(facing.getStepX(), facing.getStepY(), facing.getStepZ());
+        orientation.transform(bow);
+        var motion = RemoteManeuver.resolve(input, bow.x, bow.z, speedLimit);
+        var position = pose.position();
+        boolean withinBorder = level.getWorldBorder().isWithinBounds(
+                BlockPos.containing(position.x() + motion.x(), position.y(), position.z() + motion.z()));
+        double projectedHeight = position.y() + motion.y();
+        boolean withinHeight = projectedHeight >= level.getMinBuildHeight() && projectedHeight < level.getMaxBuildHeight();
+        return new RemoteManeuver.Motion(withinBorder ? motion.x() : 0.0, withinHeight ? motion.y() : 0.0,
+                withinBorder ? motion.z() : 0.0, motion.yaw());
+    }
+
+    private void resetHover() {
+        hover.reset();
+        hover.resetHeightSampling();
+        precisionHover = false;
+        hoverVerticalInput = false;
+    }
+
     /**
      * Auto-level (M3 revision, 2026-09-02 user ruling): one-shot pitch/roll -> 0,
      * keep heading. A "panic button" for disorientation — unlike the self-balance
      * switch's release-stick leveling this is an on-demand, single-shot action in
-     * starship mode. Triggered by the C key (keyboard channel) or the A
-     * button (gamepad channel). Physics thread only.
+     * starship mode. Also used when a completed coordinate strike releases
+     * axis pointing. Physics thread only.
      */
-    private void engageAutoLevel(Pose3d pose) {
+    private void engageAutoLevel(Pose3d pose, boolean afterAxisStrike) {
         Direction bow = getBlockState().getValue(BridgeCoreBlock.FACING);
         Vector3d bowLocal = new Vector3d(bow.getStepX(), bow.getStepY(), bow.getStepZ());
         Quaterniond leveled = new Quaterniond();
-        if (AttitudeController.levelTarget(pose.orientation(), bowLocal, leveled)) {
+        // A near-vertical bow has no horizontal heading. Use the ship's side axis for strike recovery.
+        if (AttitudeController.levelTarget(pose.orientation(), bowLocal, leveled)
+                || (afterAxisStrike && AttitudeController.levelTarget(pose.orientation(),
+                        new Vector3d(-bowLocal.z, 0.0, bowLocal.x), leveled))) {
             starshipAttitudeTarget.set(leveled);
             hadRateInput = false;
         }
@@ -2147,13 +2686,17 @@ public class BridgeCoreBlockEntity extends BlockEntity implements BlockEntitySub
         if (afforded >= cost) {
             return 1.0;
         }
-        if (afforded <= 0.0) {
-            if (physicsFrames - lastStarveLogFrame >= 100) {
-                lastStarveLogFrame = physicsFrames;
-                BridgeCoreMod.LOGGER.warn("[bridgecore] control starved: structure pools empty at {}", worldPosition);
-            }
-            return 0.0;
+        if (physicsFrames - lastStarveLogFrame >= 100) {
+            lastStarveLogFrame = physicsFrames;
+            long stored = energyAccount.totalStored();
+            BridgeCoreMod.LOGGER.warn("[bridgecore] control starved: {} at {} (requested {} FE, granted {} FE, stored {} FE)",
+                    stored > 0 ? "distributor output limit" : "distributor energy exhausted",
+                    worldPosition, fmt(cost), fmt(afforded), stored);
         }
         return afforded / cost;
+    }
+
+    private static String fmt(double v) {
+        return String.format("%.4f", v);
     }
 }

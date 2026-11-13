@@ -119,6 +119,10 @@ public final class SwivelTurretActuator implements TurretActuator {
     // defaults = unrestricted (legacy behaviour).
     private double yawMinDeg = -180.0, yawMaxDeg = 180.0; // yaw arc bounds, -180..180
     private double pitchMinDeg = -90.0, pitchMaxDeg = 90.0;
+    private static final SectorArc.Limits SECTOR_YAW = new SectorArc.Limits(-180, 180);
+    private static final SectorArc.Limits SECTOR_PITCH = new SectorArc.Limits(-90, 90);
+    private SectorArc sectorArc = SectorArc.UNIFORM;
+    private boolean sectorsActive;
     /** Rest-pose twists sampled at calibration start (pre-probe) = arc centers.
      *  NaN on legacy saves → lazily adopted from the first measured twist. */
     private double yawZeroTwist = Double.NaN, pitchZeroTwist = Double.NaN;
@@ -179,8 +183,15 @@ public final class SwivelTurretActuator implements TurretActuator {
     private int calTimer;
     private int restStableTicks;  // return-to-rest gate stability counter
     private double restLastYaw = Double.NaN, restLastPitch = Double.NaN; // measured-stillness samples
-    private double restDrivePrevRel = Double.NaN; // return-to-rest divergence guard
-    private int restDriveBadTicks;
+    // R3-1: 回位发散保护按轴独立——两轴共用一份 prev/badTicks 会逐 tick 交替
+    // 污染, 且任一轴达标就把另一轴的样本清掉, 等于没有保护。
+    private double restDrivePrevRelYaw = Double.NaN, restDrivePrevRelPitch = Double.NaN;
+    private int restDriveBadTicksYaw, restDriveBadTicksPitch;
+    /** R3-4: 整轮 IDLE(回正+稳定)计时, 20s 无进展即失败退出。 */
+    private int calIdleTicks;
+    /** R3-3: 无装配零点且无历史零位的旧存档, 首次校准不采信"只静止未驱动"
+     *  的偏航姿态; 提示玩家手动回正后重点一次重新校准 = 确认零位。 */
+    private boolean awaitingZeroConfirm, legacyZeroConfirmed;
     private double calT0, calB0;      // probe samples: reference twist / target register
     private int retryTimer;
     private double pendingLookX = Double.NaN, pendingLookY, pendingLookZ; // muzzle capture
@@ -198,8 +209,7 @@ public final class SwivelTurretActuator implements TurretActuator {
      *  applies it when the candidate verifies (bearing/block actually there). */
     private boolean yawRelocated, pitchRelocated;
     private Double lastYawWritten, lastPitchWritten;
-    /** Debug telemetry (2026-09-26 fixed-bias hunt): last measured/desired
-     *  muzzle directions and per-axis errors, echoed by [turret-watch]. */
+    /** Runtime aiming state: last measured/desired muzzle directions and per-axis errors. */
     private Vec3 lastCur, lastDes;
     private Double lastYawErr, lastPitchErr;
     /** Frozen-cmd hunt (2026-09-26, turret 2 walked to twist=90° then never
@@ -309,6 +319,25 @@ public final class SwivelTurretActuator implements TurretActuator {
     public double yawMaxDeg() { return yawMaxDeg; }
     public double pitchMinDeg() { return pitchMinDeg; }
     public double pitchMaxDeg() { return pitchMaxDeg; }
+    public SectorArc sectorArc() { return sectorsActive ? sectorArc : SectorArc.UNIFORM; }
+
+    public void setSectorArc(SectorArc arc) {
+        if (sectorArc().equals(arc)) return;
+        if (arc.enabled()) {
+            sectorArc = arc;
+            sectorsActive = true;
+        } else {
+            sectorsActive = false;
+        }
+        arcYawLimited = arcPitchLimited = true;
+        yawSettled = pitchSettled = false;
+        markDirty.run();
+    }
+
+    public void resumeSectorArc(SectorArc initial) {
+        if (!sectorsActive) setSectorArc(sectorArc.enabled() ? sectorArc : initial);
+    }
+
     /** Measured angles vs arc zeros, refreshed every actuator tick including
      * idle/return-to-rest. Pitch is up-positive for either mounting side.
      * NaN means the pose or zero is unavailable, never a stale last aim. */
@@ -316,7 +345,10 @@ public final class SwivelTurretActuator implements TurretActuator {
     public double relPitchDeg() { return lastRelPitch; }
     /** False while the arc clamp is pinning a joint (target outside the fire
      *  arc) — the fire gate must read 禁射. */
-    public boolean isInArc() { return !arcYawLimited && !arcPitchLimited; }
+    public boolean isInArc() {
+        return !arcYawLimited && !arcPitchLimited && (!sectorsActive
+                || sectorArc.contains(lastRelYaw, lastRelPitch, SECTOR_YAW, SECTOR_PITCH));
+    }
 
     /**
      * Distributed-lock reachability test (火力指挥层④, 2026-10-08): would
@@ -329,6 +361,10 @@ public final class SwivelTurretActuator implements TurretActuator {
      * False when unpaired/uncalibrated or the structure does not resolve.
      */
     public boolean isDirectionInArc(ServerLevel level, Vec3 desWorld) {
+        if (sectorsActive) {
+            var arc = previewArc(level);
+            return arc != null && arc.test(desWorld);
+        }
         if (!isPaired() || !calibrated || muzzleLocal == null) return false;
         Joints j = resolve(level);
         if (j == null || j.gun() == null || j.yawAttached() == null) return false;
@@ -344,21 +380,58 @@ public final class SwivelTurretActuator implements TurretActuator {
     private boolean jointInArc(Joints j, Vec3 cur, Vec3 des, boolean yawJoint) {
         Vec3 axisW = poseQuat(yawJoint ? j.yawContainer() : j.yawAttached())
                 .rotate(yawJoint ? yawAxisLocalCached : pitchAxisLocalCached).normalized();
+        return jointInArc(axisW, cur, des, referenceTwist(j, yawJoint),
+                yawJoint ? yawZeroTwist : pitchZeroTwist, yawJoint ? 1 : pitchUpSense,
+                yawJoint ? yawMinDeg : pitchMinDeg, yawJoint ? yawMaxDeg : pitchMaxDeg);
+    }
+
+    private static boolean jointInArc(@Nullable Vec3 axisW, Vec3 cur, Vec3 des, double measured,
+                                      double zero, int sense, double limMin, double limMax) {
         if (axisW == null) return true; // no axis info: don't veto
         Double err = GimbalMath.axisErrorDeg(axisW, cur, des);
         if (err == null) return true; // singular (target along the axis): this joint can't help, don't veto
-        double measured = referenceTwist(j, yawJoint);
-        double zero = yawJoint ? yawZeroTwist : pitchZeroTwist;
         if (Double.isNaN(zero)) zero = measured;
-        double required = (yawJoint ? 1 : pitchUpSense) * (GimbalMath.wrapDeg(measured - zero) + err);
-        double limMin = yawJoint ? yawMinDeg : pitchMinDeg;
-        double limMax = yawJoint ? yawMaxDeg : pitchMaxDeg;
+        double required = sense * (GimbalMath.wrapDeg(measured - zero) + err);
         return required >= limMin - 0.5 && required <= limMax + 0.5;
+    }
+
+    /** One pose read for all mounts on this turret, without updating actuator state. */
+    @Nullable java.util.function.Predicate<Vec3> previewArc(ServerLevel level) {
+        if (!isReady() || muzzleLocal == null || !level.hasChunkAt(yawPos) || !level.hasChunkAt(pitchPos)) return null;
+        Joints j = resolve(level);
+        if (j == null || j.gun() == null || j.yawAttached() == null) return null;
+        Vec3 cur = poseQuat(j.gun()).rotate(muzzleLocal).normalized();
+        Vec3 yawAxis = axisOf(level, yawPos);
+        Vec3 pitchAxis = axisOf(level, pitchPos);
+        Quat yawFrame = poseQuat(j.yawContainer());
+        Quat pitchFrame = poseQuat(j.yawAttached());
+        Quat pitchRelative = pitchFrame.negate().multiply(poseQuat(j.gun()));
+        double yaw = GimbalMath.twistDeg(yawFrame.negate().multiply(pitchFrame), yawAxis);
+        double pitch = GimbalMath.twistDeg(pitchRelative, pitchAxis);
+        if (cur == null || !Double.isFinite(yaw) || !Double.isFinite(pitch)) return null;
+        int sense = GimbalMath.pitchUpSense(pitchAxis, pitchRelative.rotate(muzzleLocal),
+                GimbalMath.wrapDeg(pitch - pitchZeroTwist));
+        int up = sense == 0 ? pitchUpSense : sense;
+        Vec3 yawWorld = yawFrame.rotate(yawAxis).normalized();
+        Vec3 pitchWorld = pitchFrame.rotate(pitchAxis).normalized();
+        if (sectorsActive) {
+            double relYaw = relativeTwist(yaw, yawZeroTwist);
+            double rawPitch = relativeTwist(pitch, pitchZeroTwist);
+            var profile = sectorArc;
+            return dir -> {
+                var step = sectorAim(profile, yawWorld, pitchWorld, cur, dir, relYaw, rawPitch, up,
+                        SECTOR_YAW, SECTOR_PITCH);
+                return step != null && step.targetAllowed();
+            };
+        }
+        return dir -> jointInArc(yawWorld, cur, dir, yaw, yawZeroTwist, 1, yawMinDeg, yawMaxDeg)
+                && jointInArc(pitchWorld, cur, dir, pitch, pitchZeroTwist, up, pitchMinDeg, pitchMaxDeg);
     }
 
     /** GUI drag handle: param 0=yaw min, 1=yaw max, 2=pitch min, 3=pitch max;
      *  absolute set, clamped against the opposite bound. */
     public void setArc(int param, double valueDeg) {
+        if (sectorsActive) return;
         switch (param) {
             case 0 -> yawMinDeg = Math.max(-180.0, Math.min(yawMaxDeg, valueDeg));
             case 1 -> yawMaxDeg = Math.max(yawMinDeg, Math.min(180.0, valueDeg));
@@ -375,12 +448,16 @@ public final class SwivelTurretActuator implements TurretActuator {
      *  "[船]ship:xxxxxx" targets 5m away — locking one is the aim loop chasing
      *  its own gun barrel). Empty set when unpaired/unassembled. */
     public java.util.Set<java.util.UUID> ownChildSubLevelIds(Level level) {
+        return childSubLevelIds(level, false);
+    }
+
+    java.util.Set<java.util.UUID> childSubLevelIds(Level level, boolean loadedOnly) {
         java.util.Set<java.util.UUID> out = new java.util.HashSet<>();
-        if (yawPos != null) {
+        if (yawPos != null && (!loadedOnly || level.hasChunkAt(yawPos))) {
             SwivelBearingBlockEntity be = bearingAt(level, yawPos);
             if (be != null && be.getSubLevelID() != null) out.add(be.getSubLevelID());
         }
-        if (pitchPos != null) {
+        if (pitchPos != null && (!loadedOnly || level.hasChunkAt(pitchPos))) {
             SwivelBearingBlockEntity be = bearingAt(level, pitchPos);
             if (be != null && be.getSubLevelID() != null) out.add(be.getSubLevelID());
         }
@@ -422,6 +499,12 @@ public final class SwivelTurretActuator implements TurretActuator {
         calState = Cal.IDLE;
         retryTimer = 0;
         restStableTicks = 0;
+        // R3-6b: 重配对=新炮塔, 清掉上一台的回位/稳定/确认运行态
+        calIdleTicks = 0;
+        restLastYaw = restLastPitch = Double.NaN;
+        restDrivePrevRelYaw = restDrivePrevRelPitch = Double.NaN;
+        restDriveBadTicksYaw = restDriveBadTicksPitch = 0;
+        awaitingZeroConfirm = legacyZeroConfirmed = false;
         yawRelocated = pitchRelocated = false;
         lastYawWritten = lastPitchWritten = null;
         yawSettled = pitchSettled = false;
@@ -433,6 +516,8 @@ public final class SwivelTurretActuator implements TurretActuator {
         yawMaxDeg = 180.0;
         pitchMinDeg = -90.0;
         pitchMaxDeg = 90.0;
+        sectorArc = SectorArc.UNIFORM;
+        sectorsActive = false;
         yawZeroTwist = pitchZeroTwist = Double.NaN;
         arcYawLimited = arcPitchLimited = false;
         status = "已配对，待校准";
@@ -440,6 +525,15 @@ public final class SwivelTurretActuator implements TurretActuator {
     }
 
     public void unpair(@Nullable Level level) {
+        // R3-6a: 探针中解配——先把寄存器恢复回 calB0, 否则原生伺服会把
+        // 已解配的炮头继续转到 calB0+5° 的探针目标
+        if (level instanceof ServerLevel sl
+                && (calState == Cal.YAW_PROBE || calState == Cal.PITCH_PROBE)
+                && Double.isFinite(calB0)) {
+            BlockPos probePos = calState == Cal.YAW_PROBE ? yawPos : pitchPos;
+            SwivelBearingBlockEntity probeBe = probePos == null ? null : bearingAt(sl, probePos);
+            if (probeBe != null) writeAngle(sl, probeBe, calB0);
+        }
         // force fresh AxisLock captures: a future pairing on these bearings
         // re-measures its zero from the live pose behind the settle gate
         if (level instanceof ServerLevel sl) {
@@ -457,6 +551,11 @@ public final class SwivelTurretActuator implements TurretActuator {
         lastFireNote = null;
         calState = Cal.IDLE;
         restStableTicks = 0;
+        calIdleTicks = 0;
+        restLastYaw = restLastPitch = Double.NaN;
+        restDrivePrevRelYaw = restDrivePrevRelPitch = Double.NaN;
+        restDriveBadTicksYaw = restDriveBadTicksPitch = 0;
+        awaitingZeroConfirm = legacyZeroConfirmed = false;
         noTargetTicks = 0;
         aimErrorDeg = Double.NaN;
         status = "未配对";
@@ -474,6 +573,14 @@ public final class SwivelTurretActuator implements TurretActuator {
         calState = Cal.IDLE;
         retryTimer = 0;
         restStableTicks = 0;
+        // R3-6: 重校清干净回位/稳定运行态, 不沿用上一台(或上一轮)的采样
+        calIdleTicks = 0;
+        restLastYaw = restLastPitch = Double.NaN;
+        restDrivePrevRelYaw = restDrivePrevRelPitch = Double.NaN;
+        restDriveBadTicksYaw = restDriveBadTicksPitch = 0;
+        // R3-3: 玩家在我们请求确认后重点「重新校准」= 确认当前回正姿态为零位
+        legacyZeroConfirmed = awaitingZeroConfirm;
+        awaitingZeroConfirm = false;
         yawSettled = pitchSettled = false;
         lastYawWritten = lastPitchWritten = null;
         verifyYaw.reset();
@@ -512,6 +619,18 @@ public final class SwivelTurretActuator implements TurretActuator {
         tag.putDouble("turretArcYawMax", yawMaxDeg);
         tag.putDouble("turretArcPitchMin", pitchMinDeg);
         tag.putDouble("turretArcPitchMax", pitchMaxDeg);
+        int[] sectors = new int[sectorArc.endpoints().size() * 3];
+        int disabledSectors = 0;
+        for (int i = 0; i < sectorArc.endpoints().size(); i++) {
+            var point = sectorArc.endpoints().get(i);
+            sectors[i * 3] = point.yaw();
+            sectors[i * 3 + 1] = point.lower();
+            sectors[i * 3 + 2] = point.upper();
+            if (!point.enabled()) disabledSectors |= 1 << i;
+        }
+        tag.putIntArray("turretArcSectors", sectors);
+        tag.putInt("turretArcSectorsDisabled", disabledSectors);
+        tag.putBoolean("turretArcSectorsActive", sectorsActive);
         if (!Double.isNaN(yawZeroTwist)) tag.putDouble("turretYawZero", yawZeroTwist);
         if (!Double.isNaN(pitchZeroTwist)) tag.putDouble("turretPitchZero", pitchZeroTwist);
         if (muzzleLocal != null) {
@@ -545,28 +664,86 @@ public final class SwivelTurretActuator implements TurretActuator {
                     Math.min(FIRE_INTERVAL_GEARS[FIRE_INTERVAL_GEARS.length - 1],
                             tag.getInt("turretFireInterval")));
         }
-        if (tag.contains("turretBarrelLen")) barrelLengthBlocks = tag.getDouble("turretBarrelLen");
+        // R7-5: 载入统一有限性闸门——Math.min/max 拦不住 NaN, 弹道/射界/零位
+        // 脏值会在存档里永久驻留。非有限 = 保留默认(零位例外: 未知=NaN, 不归 0)。
+        if (tag.contains("turretBarrelLen")) {
+            double v = tag.getDouble("turretBarrelLen");
+            if (Double.isFinite(v) && v >= 0) barrelLengthBlocks = v;
+        }
         if (tag.contains("turretSignYaw")) signYaw = tag.getInt("turretSignYaw") >= 0 ? 1 : -1;
         if (tag.contains("turretSignPitch")) signPitch = tag.getInt("turretSignPitch") >= 0 ? 1 : -1;
         if (tag.contains("turretCalibrated")) calibrated = tag.getBoolean("turretCalibrated");
-        if (tag.contains("turretArcYawMin")) {
+        // R7-7: 射界键成对读——半套键(如只有 yawMin)曾经把 max 读成 0,
+        // 射界倒置 = 永久禁射。缺半对 = 整对回默认 + warn; 读入后统一钳位
+        // 并按需交换 min/max。
+        if (tag.contains("turretArcYawMin") && tag.contains("turretArcYawMax")) {
             yawMinDeg = tag.getDouble("turretArcYawMin");
             yawMaxDeg = tag.getDouble("turretArcYawMax");
+        } else if (tag.contains("turretArcYawMin") != tag.contains("turretArcYawMax")) {
+            com.bridgecore.BridgeCoreMod.LOGGER.warn(
+                    "[firecontrol] half-set yaw arc keys in save — pair reset to defaults");
         } else if (tag.contains("turretArcYawHalf")) {
             // migrate the short-lived symmetric-half model (2a7e29c)
             double h = tag.getDouble("turretArcYawHalf");
-            yawMinDeg = -h;
-            yawMaxDeg = h;
+            if (Double.isFinite(h)) {
+                yawMinDeg = -Math.min(180, Math.abs(h));
+                yawMaxDeg = Math.min(180, Math.abs(h));
+            }
         }
-        if (tag.contains("turretArcPitchMin")) pitchMinDeg = tag.getDouble("turretArcPitchMin");
-        if (tag.contains("turretArcPitchMax")) pitchMaxDeg = tag.getDouble("turretArcPitchMax");
-        if (tag.contains("turretYawZero")) yawZeroTwist = tag.getDouble("turretYawZero");
-        if (tag.contains("turretPitchZero")) pitchZeroTwist = tag.getDouble("turretPitchZero");
+        if (tag.contains("turretArcPitchMin") && tag.contains("turretArcPitchMax")) {
+            pitchMinDeg = tag.getDouble("turretArcPitchMin");
+            pitchMaxDeg = tag.getDouble("turretArcPitchMax");
+        } else if (tag.contains("turretArcPitchMin") != tag.contains("turretArcPitchMax")) {
+            com.bridgecore.BridgeCoreMod.LOGGER.warn(
+                    "[firecontrol] half-set pitch arc keys in save — pair reset to defaults");
+        }
+        yawMinDeg = clampArc(yawMinDeg, -180); yawMaxDeg = clampArc(yawMaxDeg, 180);
+        pitchMinDeg = clampArc(pitchMinDeg, -90); pitchMaxDeg = clampArc(pitchMaxDeg, 90);
+        if (yawMinDeg > yawMaxDeg) { double t = yawMinDeg; yawMinDeg = yawMaxDeg; yawMaxDeg = t; }
+        if (pitchMinDeg > pitchMaxDeg) { double t = pitchMinDeg; pitchMinDeg = pitchMaxDeg; pitchMaxDeg = t; }
+        if (tag.contains("turretArcSectors")) {
+            loadSectorArc(tag.getIntArray("turretArcSectors"), tag.getInt("turretArcSectorsDisabled"));
+            sectorsActive = sectorArc.enabled()
+                    && (!tag.contains("turretArcSectorsActive") || tag.getBoolean("turretArcSectorsActive"));
+        }
+        if (tag.contains("turretYawZero")) {
+            double z = tag.getDouble("turretYawZero");
+            yawZeroTwist = Double.isFinite(z) ? z : Double.NaN; // 非有限=未知, 不归 0
+        }
+        if (tag.contains("turretPitchZero")) {
+            double z = tag.getDouble("turretPitchZero");
+            pitchZeroTwist = Double.isFinite(z) ? z : Double.NaN;
+        }
         if (tag.contains("turretMuzzleX")) {
-            muzzleLocal = new Vec3(tag.getDouble("turretMuzzleX"),
-                    tag.getDouble("turretMuzzleY"), tag.getDouble("turretMuzzleZ"));
+            double mx = tag.getDouble("turretMuzzleX"), my = tag.getDouble("turretMuzzleY"),
+                    mz = tag.getDouble("turretMuzzleZ");
+            if (Double.isFinite(mx) && Double.isFinite(my) && Double.isFinite(mz)) {
+                muzzleLocal = new Vec3(mx, my, mz);
+            }
         }
         if (isPaired()) status = calibrated ? "就绪" : "已配对，待校准";
+    }
+
+    /** R7-5/7: arc load normalization — non-finite falls back to the field's
+     *  default, the rest clamps into [-180,180]. */
+    private static double clampArc(double v, double fallback) {
+        if (!Double.isFinite(v)) return fallback;
+        return Math.max(-180, Math.min(180, v));
+    }
+
+    private void loadSectorArc(int[] data, int disabled) {
+        sectorArc = SectorArc.UNIFORM;
+        if (data.length % 3 != 0 || data.length > SectorArc.MAX_ENDPOINTS * 3) return;
+        var points = new ArrayList<SectorArc.Endpoint>();
+        try {
+            for (int i = 0; i < data.length / 3; i++) {
+                points.add(new SectorArc.Endpoint(data[i * 3], data[i * 3 + 1], data[i * 3 + 2],
+                        (disabled & (1 << i)) == 0));
+            }
+            sectorArc = new SectorArc(points);
+        } catch (IllegalArgumentException invalid) {
+            // Fall back to the saved regular arc if the sector data is invalid.
+        }
     }
 
     // ---------------- structure resolution ----------------
@@ -763,6 +940,14 @@ public final class SwivelTurretActuator implements TurretActuator {
      *                 the current joints (no solution / out of range)
      */
     public void tick(ServerLevel level, @Nullable Vec3 desWorld) {
+        tick(level, desWorld, false);
+    }
+
+    void holdForHullTurn(ServerLevel level) {
+        tick(level, null, true);
+    }
+
+    private void tick(ServerLevel level, @Nullable Vec3 desWorld, boolean holdForHullTurn) {
         lastRelYaw = lastRelPitch = Double.NaN;
         if (!isPaired()) {
             status = "未配对";
@@ -771,6 +956,12 @@ public final class SwivelTurretActuator implements TurretActuator {
         tickCount++;
         reanchorToCore(level);
         relocateAfterAssembly(level);
+        // R2-3: heartbeat is decoupled from structural resolvability — a resolve
+        //  failure (transient missing BE / assembly switch) must not starve the
+        //  AxisLock heartbeat into a lapse+recapture cycle. Identity of the
+        //  child is still verified per substep by AxisLock's enforceOne.
+        SwivelBearingAxisLock.claim(level, yawPos, signYaw);
+        SwivelBearingAxisLock.claim(level, pitchPos, signPitch);
         Joints j = resolve(level);
         if (j == null) {
             status = "轴承丢失(方块被拆?)";
@@ -780,12 +971,7 @@ public final class SwivelTurretActuator implements TurretActuator {
         yawAxisLocalCached = axisOf(level, yawPos);
         pitchAxisLocalCached = axisOf(level, pitchPos);
         updateJointAngles(j);
-        // AxisLock heartbeat (kinematic takeover of shipborne bearings): claim
-        // every tick while paired — during calibration too, with the provisional
-        // sign (+1); the probe self-identifies the true SIGN under takeover.
         // Ground bearings: claim() no-ops, native servo keeps driving.
-        SwivelBearingAxisLock.claim(level, yawPos, signYaw);
-        SwivelBearingAxisLock.claim(level, pitchPos, signPitch);
         if (!calibrated) {
             tickCalibration(level, j);
             return;
@@ -796,12 +982,42 @@ public final class SwivelTurretActuator implements TurretActuator {
             aimErrorDeg = Double.NaN;
             return;
         }
+        if (sectorsActive && (!Double.isFinite(yawZeroTwist) || !Double.isFinite(pitchZeroTwist))) {
+            if (!Double.isFinite(yawZeroTwist)) yawZeroTwist = referenceTwist(j, true);
+            if (!Double.isFinite(pitchZeroTwist)) pitchZeroTwist = referenceTwist(j, false);
+            updateJointAngles(j);
+            markDirty.run();
+        }
         if (desWorld == null) {
             aimErrorDeg = Double.NaN;
+            if (holdForHullTurn) {
+                noTargetTicks = 0;
+                if (sectorsActive) {
+                    driveSectorStep(level, j, sectorArc.step(lastRelYaw, lastRelPitch, lastRelYaw, lastRelPitch,
+                            SECTOR_YAW, SECTOR_PITCH), MAX_STEP_DEG);
+                }
+                status = "等待舰姿对准";
+                return;
+            }
             // 脱战延时收炮 (user ruling 2026-10-06: 5s): after the grace
             // window, drive both joints back to the recorded arc zero through
             // the calibration rest mechanism; a new target cancels instantly
-            if (++noTargetTicks >= REST_RETURN_DELAY_TICKS) {
+            if (sectorsActive) {
+                ++noTargetTicks;
+                boolean rest = noTargetTicks >= REST_RETURN_DELAY_TICKS;
+                double restYaw = rest ? sectorArc.restYaw(SECTOR_PITCH) : lastRelYaw;
+                var step = sectorArc.step(lastRelYaw, lastRelPitch, restYaw, rest ? 0 : lastRelPitch,
+                        SECTOR_YAW, SECTOR_PITCH);
+                driveSectorStep(level, j, step, MAX_STEP_DEG);
+                arcYawLimited = true;
+                if (sectorArc.limitsAt(lastRelYaw, SECTOR_PITCH).empty()) {
+                    status = Math.abs(step.yawDelta()) > 0 || Math.abs(step.pitch() - lastRelPitch) > 0.05
+                            ? "回到启用分区中..." : "当前偏航无可用分区";
+                    return;
+                }
+                status = rest && (Math.abs(step.yawDelta()) > 0.05 || Math.abs(step.pitch() - lastRelPitch) > 0.05)
+                        ? "脱战回位中..." : "就绪(无目标)";
+            } else if (++noTargetTicks >= REST_RETURN_DELAY_TICKS) {
                 status = driveToRest(level, j) ? "就绪(无目标)" : "脱战回位中...";
             } else {
                 status = "就绪(无目标)";
@@ -840,15 +1056,22 @@ public final class SwivelTurretActuator implements TurretActuator {
 
         // yaw joint: axis fixed in the yaw bearing's container frame
         Vec3 yawAxisW = poseQuat(j.yawContainer()).rotate(yawAxisLocalCached).normalized();
-        yawSettled = aimJoint(level, j.yawBe(), yawAxisW, cur, des,
-                signYaw, referenceTwist(j, true), yawSettled, true,
-                maxStep, gain, hold, release);
-
         // pitch joint: axis fixed in the yaw structure's frame
         Vec3 pitchAxisW = poseQuat(j.yawAttached()).rotate(pitchAxisLocalCached).normalized();
-        pitchSettled = aimJoint(level, j.pitchBe(), pitchAxisW, cur, des,
-                signPitch, referenceTwist(j, false), pitchSettled, false,
-                maxStep, gain, hold, release);
+        boolean crossingSector = false;
+        if (sectorsActive) {
+            var step = sectorAim(sectorArc, yawAxisW, pitchAxisW, cur, des, lastRelYaw, pitchUpSense * lastRelPitch,
+                    pitchUpSense, SECTOR_YAW, SECTOR_PITCH);
+            boolean driven = step != null && driveSectorStep(level, j, step, maxStep);
+            arcYawLimited = !driven || step.crossing();
+            arcPitchLimited = !driven || !step.targetAllowed();
+            crossingSector = driven && step.crossing() && step.targetAllowed();
+        } else {
+            yawSettled = aimJoint(level, j.yawBe(), yawAxisW, cur, des,
+                    signYaw, referenceTwist(j, true), yawSettled, true, maxStep, gain, hold, release);
+            pitchSettled = aimJoint(level, j.pitchBe(), pitchAxisW, cur, des,
+                    signPitch, referenceTwist(j, false), pitchSettled, false, maxStep, gain, hold, release);
+        }
 
         aimErrorDeg = GimbalMath.angleBetweenDeg(cur, des);
         lastCur = cur;
@@ -857,7 +1080,133 @@ public final class SwivelTurretActuator implements TurretActuator {
         lastPitchErr = GimbalMath.axisErrorDeg(pitchAxisW, cur, des);
         boolean limited = arcYawLimited || arcPitchLimited;
         status = String.format("跟踪中 误差%.1f°%s", aimErrorDeg,
-                limited ? " [射界外·禁射]" : aimErrorDeg < 1.5 ? " [可开火]" : "");
+                crossingSector ? " [跨区限位·禁射]" : limited ? " [射界外·禁射]" : aimErrorDeg < 1.5 ? " [可开火]" : "");
+    }
+
+    private static double relativeTwist(double measured, double zero) {
+        return Double.isFinite(zero) ? GimbalMath.wrapDeg(measured - zero) : 0;
+    }
+
+    private static @Nullable SectorArc.Step sectorAim(SectorArc profile, @Nullable Vec3 yawAxis, @Nullable Vec3 pitchAxis,
+            Vec3 current, Vec3 desired, double yaw, double rawPitch, int pitchSense,
+            SectorArc.Limits yawLimits, SectorArc.Limits pitchLimits) {
+        var angles = solveJointAngles(yawAxis, pitchAxis, current, desired, yaw, rawPitch, pitchSense);
+        return angles == null ? null : profile.step(yaw, pitchSense * rawPitch, angles.yaw(), angles.pitch(),
+                yawLimits, pitchLimits);
+    }
+
+    record JointAngles(double yaw, double pitch) {}
+
+    private static @Nullable JointAngles solveJointAngles(@Nullable Vec3 yawAxis, @Nullable Vec3 pitchAxis,
+            Vec3 current, Vec3 desired, double yaw, double rawPitch, int pitchSense) {
+        if (yawAxis == null || pitchAxis == null || !Double.isFinite(yaw) || !Double.isFinite(rawPitch)) return null;
+        Vec3 neutralPitch = rotateAround(current, pitchAxis, -rawPitch);
+        Double yawError = GimbalMath.axisErrorDeg(yawAxis, neutralPitch, desired);
+        double yawDelta = yawError == null ? 0 : yawError;
+        // Solve pitch in the prospective yaw frame, where the pitch hinge will actually be.
+        Vec3 desiredAtCurrentYaw = rotateAround(desired, yawAxis, -yawDelta);
+        Double pitchError = GimbalMath.axisErrorDeg(pitchAxis, current, desiredAtCurrentYaw);
+        double pitchDelta = pitchError == null ? 0 : pitchError;
+        if (!Double.isFinite(yawDelta) || !Double.isFinite(pitchDelta)) return null;
+        return new JointAngles(yaw + yawDelta, pitchSense * (rawPitch + pitchDelta));
+    }
+
+    /** All vectors here use the current world frame. A candidate hull rotation is applied outside this snapshot. */
+    record PoseGeometry(Vec3 muzzle, Vec3 yawAxis, Vec3 pitchAxis, Vec3 yawPivot, Vec3 pitchPivot,
+                        double yaw, double rawPitch, int pitchSense, SectorArc sectors,
+                        SectorArc.Limits yawLimits, SectorArc.Limits pitchLimits) {
+        @Nullable JointAngles solve(Vec3 direction) {
+            return solveJointAngles(yawAxis, pitchAxis, muzzle, direction, yaw, rawPitch, pitchSense);
+        }
+
+        double margin(JointAngles angles) {
+            var step = sectors.step(yaw, pitchSense * rawPitch, angles.yaw(), angles.pitch(), yawLimits, pitchLimits);
+            if (!step.targetAllowed()) return -1;
+            return sectors.marginAt(angles.yaw(), angles.pitch(), yawLimits, pitchLimits);
+        }
+
+        Vec3 directionAfterAim(JointAngles angles) {
+            Vec3 pitched = rotateAround(muzzle, pitchAxis, pitchSense * angles.pitch() - rawPitch);
+            return rotateAround(pitched, yawAxis, angles.yaw() - yaw);
+        }
+
+        Vec3 rootAfterAim(Vec3 root, JointAngles angles) {
+            double deltaPitch = pitchSense * angles.pitch() - rawPitch;
+            Vec3 pitched = pitchPivot.add(rotateAround(root.sub(pitchPivot), pitchAxis, deltaPitch));
+            return yawPivot.add(rotateAround(pitched.sub(yawPivot), yawAxis, angles.yaw() - yaw));
+        }
+    }
+
+    @Nullable PoseGeometry previewPoseGeometry(ServerLevel level, ServerSubLevel hull) {
+        if (!isReady() || muzzleLocal == null || !level.hasChunkAt(yawPos) || !level.hasChunkAt(pitchPos)) return null;
+        Joints joints = resolve(level);
+        if (joints == null || joints.yawContainer() != hull || joints.yawAttached() == null || joints.gun() == null) return null;
+        var localYaw = axisOf(level, yawPos);
+        var localPitch = axisOf(level, pitchPos);
+        var hullRotation = poseQuat(hull);
+        var headRotation = poseQuat(joints.yawAttached());
+        var gunRotation = poseQuat(joints.gun());
+        var pitchRelative = headRotation.negate().multiply(gunRotation);
+        double yaw = relativeTwist(GimbalMath.twistDeg(hullRotation.negate().multiply(headRotation), localYaw), yawZeroTwist);
+        double rawPitch = relativeTwist(GimbalMath.twistDeg(pitchRelative, localPitch), pitchZeroTwist);
+        int sense = GimbalMath.pitchUpSense(localPitch, pitchRelative.rotate(muzzleLocal), rawPitch);
+        Vec3 muzzle = gunRotation.rotate(muzzleLocal).normalized();
+        if (muzzle == null || !Double.isFinite(yaw) || !Double.isFinite(rawPitch)) return null;
+        return new PoseGeometry(muzzle, hullRotation.rotate(localYaw), headRotation.rotate(localPitch),
+                hingePivot(hull, yawPos, localYaw), hingePivot(joints.yawAttached(), pitchPos, localPitch),
+                yaw, rawPitch, sense == 0 ? pitchUpSense : sense, sectorArc(),
+                sectorsActive ? SECTOR_YAW : new SectorArc.Limits(yawMinDeg, yawMaxDeg),
+                sectorsActive ? SECTOR_PITCH : new SectorArc.Limits(pitchMinDeg, pitchMaxDeg));
+    }
+
+    private static Vec3 hingePivot(ServerSubLevel parent, BlockPos pos, Vec3 axis) {
+        var anchor = parent.logicalPose().transformPosition(new net.minecraft.world.phys.Vec3(
+                pos.getX() + 0.5 + axis.x(), pos.getY() + 0.5 + axis.y(), pos.getZ() + 0.5 + axis.z()));
+        return new Vec3(anchor.x, anchor.y, anchor.z);
+    }
+
+    private static Vec3 rotateAround(Vec3 direction, Vec3 axis, double degrees) {
+        double half = Math.toRadians(degrees) * 0.5;
+        double sin = Math.sin(half);
+        return new Quat(Math.cos(half), axis.x() * sin, axis.y() * sin, axis.z() * sin).rotate(direction);
+    }
+
+    private boolean driveSectorStep(ServerLevel level, Joints joints, SectorArc.Step step, double maxStep) {
+        if (!Double.isFinite(lastRelYaw) || !Double.isFinite(lastRelPitch)) return false;
+        double yawRegister = measuredRegister(level, joints.yawBe(), joints.yawContainer(), joints.yawAttached(),
+                referenceTwist(joints, true));
+        double pitchRegister = measuredRegister(level, joints.pitchBe(), joints.yawAttached(), joints.gun(),
+                referenceTwist(joints, false));
+        if (!Double.isFinite(yawRegister) || !Double.isFinite(pitchRegister)) return false;
+        lastYawWritten = commandSectorJoint(level, joints.yawBe(), yawRegister, signYaw * step.yawDelta(), maxStep);
+        lastPitchWritten = commandSectorJoint(level, joints.pitchBe(), pitchRegister,
+                signPitch * pitchUpSense * (step.pitch() - lastRelPitch), maxStep);
+        return true;
+    }
+
+    private static double commandSectorJoint(ServerLevel level, SwivelBearingBlockEntity bearing, double measured,
+                                             double delta, double maxStep) {
+        double command = GimbalMath.norm360(measured + Math.clamp(delta, -maxStep, maxStep));
+        if (Math.abs(GimbalMath.wrapDeg(command - acc(bearing).bridgecore$getTargetAngleDegrees())) > 1e-5) {
+            writeAngle(level, bearing, command);
+        }
+        return command;
+    }
+
+    private static double measuredRegister(ServerLevel level, SwivelBearingBlockEntity bearing,
+                                           @Nullable ServerSubLevel parent, ServerSubLevel child, double twist) {
+        double axisLock = SwivelBearingAxisLock.registerAtTwist(level, bearing.getBlockPos(), twist);
+        if (Double.isFinite(axisLock)) return axisLock;
+        BlockPos plate = bearing.getPlatePos();
+        if (plate == null || !level.hasChunkAt(plate)) return Double.NaN;
+        var state = level.getBlockState(plate);
+        if (!state.hasProperty(BlockStateProperties.FACING)) return Double.NaN;
+        // Simulated's native register measures twist between the bearing and plate frames.
+        var parentFace = bearing.getBlockState().getValue(BlockStateProperties.FACING).getRotation();
+        var childFace = state.getValue(BlockStateProperties.FACING).getRotation();
+        Quat base = poseQuat(parent).multiply(new Quat(parentFace.w(), parentFace.x(), parentFace.y(), parentFace.z()));
+        Quat head = poseQuat(child).multiply(new Quat(childFace.w(), childFace.x(), childFace.y(), childFace.z()));
+        return GimbalMath.twistDeg(base.negate().multiply(head), new Vec3(0, 1, 0));
     }
 
     /**
@@ -987,6 +1336,11 @@ public final class SwivelTurretActuator implements TurretActuator {
 
     private void tickCalibration(ServerLevel level, Joints j) {
         aimErrorDeg = Double.NaN;
+        if (awaitingZeroConfirm) {
+            // R3-3: 等待玩家手动回正并重点「重新校准」确认零位
+            status = "请手动将炮口回正到装配朝向,再点一次「重新校准」确认零位";
+            return;
+        }
         if (retryTimer > 0) {
             retryTimer--;
             status = "校准待重试(" + retryTimer / 20 + "s)";
@@ -1028,6 +1382,11 @@ public final class SwivelTurretActuator implements TurretActuator {
 
         switch (calState) {
             case IDLE -> {
+                // R3-4: 整轮回正+稳定 20s(400t)无进展即失败退出
+                if (++calIdleTicks > 400) {
+                    failCalibration("回正/稳定", Double.NaN);
+                    return;
+                }
                 // return-to-rest + measured-stillness gate (2026-09-27):
                 // recalibrating while LOCKED used to sample the arc zero at
                 // the AIM pose (arc sat deflected, limits "randomly failed"),
@@ -1044,9 +1403,15 @@ public final class SwivelTurretActuator implements TurretActuator {
                 }
                 double ty = referenceTwist(j, true);
                 double tp = referenceTwist(j, false);
+                // R3-4: 两轴都查有限性(旧版 tp 不查, NaN 使稳定门恒假);
+                // 阈值 0.05→0.2°/tick: 原阈值严于轴承 PD 滞回底噪。
+                if (!Double.isFinite(ty) || !Double.isFinite(tp)) {
+                    failCalibration("姿态读取", Double.NaN);
+                    return;
+                }
                 if (!Double.isNaN(restLastYaw)
-                        && Math.abs(GimbalMath.wrapDeg(ty - restLastYaw)) < 0.05
-                        && Math.abs(GimbalMath.wrapDeg(tp - restLastPitch)) < 0.05) {
+                        && Math.abs(GimbalMath.wrapDeg(ty - restLastYaw)) < 0.2
+                        && Math.abs(GimbalMath.wrapDeg(tp - restLastPitch)) < 0.2) {
                     restStableTicks++;
                 } else {
                     restStableTicks = 0;
@@ -1059,6 +1424,19 @@ public final class SwivelTurretActuator implements TurretActuator {
                 }
                 restStableTicks = 0;
                 restLastYaw = restLastPitch = Double.NaN;
+                calIdleTicks = 0;
+                // R3-3: 无装配零点且无历史零位的旧存档, 偏航轴本轮只是静止等待
+                // (driveToRest 对无零位 yaw 不驱动)——"静止"不能证明当前姿态
+                // 就是装配零位(可能正瞄着 90° 目标)。不采信, 请玩家手动回正后
+                // 重点「重新校准」确认; 有装配零点/历史零位的单元不受影响。
+                if (!Double.isFinite(yawZeroTwist)
+                        && AxisLockAssemblyZero.get(level, yawPos, j.yawBe()) == null
+                        && !legacyZeroConfirmed) {
+                    awaitingZeroConfirm = true;
+                    calState = Cal.IDLE;
+                    markDirty.run();
+                    return;
+                }
                 // 第三批 step3 (§2.31 专门建立流程): the return-to-rest gate
                 // just passed at a user-triggered recalibration — a legacy
                 // save gets its trusted zero from THIS confirmed rest pose.
@@ -1162,21 +1540,26 @@ public final class SwivelTurretActuator implements TurretActuator {
         }
         double rel = GimbalMath.wrapDeg(referenceTwist(j, yawJoint) - zero);
         if (Math.abs(rel) < 0.5) {
-            restDrivePrevRel = Double.NaN;
-            restDriveBadTicks = 0;
+            // R3-1: 达标只清本轴样本
+            if (yawJoint) { restDrivePrevRelYaw = Double.NaN; restDriveBadTicksYaw = 0; }
+            else { restDrivePrevRelPitch = Double.NaN; restDriveBadTicksPitch = 0; }
             return true;
         }
         // fresh-turret guard: a defaulted sign may point the drive the wrong
         // way; if the error keeps growing, flip the axis convention
-        if (!Double.isNaN(restDrivePrevRel) && Math.abs(rel) > Math.abs(restDrivePrevRel) + 0.01) {
-            if (++restDriveBadTicks >= 8) {
+        double prevRel = yawJoint ? restDrivePrevRelYaw : restDrivePrevRelPitch;
+        int badTicks = yawJoint ? restDriveBadTicksYaw : restDriveBadTicksPitch;
+        if (!Double.isNaN(prevRel) && Math.abs(rel) > Math.abs(prevRel) + 0.01) {
+            if (++badTicks >= 8) {
                 if (yawJoint) signYaw = -signYaw; else signPitch = -signPitch;
-                restDriveBadTicks = 0;
+                badTicks = 0;
+                markDirty.run(); // R3-6c: 翻 sign 落盘, 重载不回旧方向
             }
         } else {
-            restDriveBadTicks = 0;
+            badTicks = 0;
         }
-        restDrivePrevRel = rel;
+        if (yawJoint) { restDriveBadTicksYaw = badTicks; restDrivePrevRelYaw = rel; }
+        else { restDriveBadTicksPitch = badTicks; restDrivePrevRelPitch = rel; }
         int sign = yawJoint ? signYaw : signPitch;
         double delta = Math.max(-MAX_STEP_DEG, Math.min(MAX_STEP_DEG, -rel));
         writeAngle(level, be, acc(be).bridgecore$getTargetAngleDegrees() + sign * delta);
@@ -1212,8 +1595,11 @@ public final class SwivelTurretActuator implements TurretActuator {
 
     private void failCalibration(String joint, double dT) {
         calState = Cal.IDLE;
+        calIdleTicks = 0;
         retryTimer = CAL_RETRY_TICKS;
-        status = String.format("%s轴校准无响应(dT=%.2f°):检查锁定/装配/结构", joint, dT);
+        status = Double.isNaN(dT)
+                ? joint + "校准失败(超时或姿态读数无效):检查装配/锁定/结构"
+                : String.format("%s轴校准无响应(dT=%.2f°):检查锁定/装配/结构", joint, dT);
     }
 
     // ---------------- TurretActuator ----------------

@@ -121,6 +121,18 @@ public final class GamepadInput {
 
     /** Payload handler entry (server thread via enqueueWork). */
     public static void onInput(UUID playerId, float[] axes, int buttons) {
+        // 2026-11-09 审查 P0-3：NaN/Inf 整帧拒收——下游 dz()/clamp() 对 NaN 放行，
+        // 一旦入库会经 linForce/torque 打进控制律并连锁污染 FE 计费。
+        if (axes == null) return;
+        for (float v : axes) {
+            if (!Float.isFinite(v)) {
+                if (!PLAYERS.containsKey(playerId)) {
+                    BridgeCoreMod.LOGGER.warn("[bridgecore] gamepad: non-finite frame rejected from {}",
+                            playerId);
+                }
+                return;
+            }
+        }
         PLAYERS.put(playerId, new Entry(axes, buttons, System.nanoTime()));
     }
 

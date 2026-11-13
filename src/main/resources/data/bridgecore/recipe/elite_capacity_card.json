@@ -1,0 +1,13 @@
+{
+  "type": "minecraft:crafting_shapeless",
+  "category": "misc",
+  "ingredients": [
+    { "item": "bridgecore:advanced_capacity_card" },
+    { "item": "minecraft:diamond" },
+    { "item": "minecraft:amethyst_shard" }
+  ],
+  "result": {
+    "id": "bridgecore:elite_capacity_card",
+    "count": 1
+  }
+}

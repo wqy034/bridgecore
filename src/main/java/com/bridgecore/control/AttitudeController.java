@@ -67,10 +67,18 @@ public final class AttitudeController {
                                          Vector3dc omegaTargetBody,
                                          Vector3dc omegaWorld, Matrix3dc inertia, Vector3d dest,
                                          double kp, double kd, double maxAlpha) {
-        dest.set(0.0, 0.0, 0.0);
-        if (mode == Mode.OFF) {
-            return dest;
-        }
+        dest.zero();
+        if (mode == Mode.OFF) return dest;
+        computeAngularAcceleration(mode, qCurrent, qTarget, omegaTargetBody, omegaWorld, dest, kp, kd);
+        limitAngularAcceleration(dest, maxAlpha);
+        return inertia.transform(dest);
+    }
+
+    /** Calculates the controller's body-frame request before trim, limiting and inertia conversion. */
+    public static Vector3d computeAngularAcceleration(Mode mode, Quaterniondc qCurrent, Quaterniondc qTarget,
+                                                      Vector3dc omegaTargetBody, Vector3dc omegaWorld,
+                                                      Vector3d dest, double kp, double kd) {
+        if (mode == Mode.OFF) return dest.zero();
 
         // omega: world -> body frame, with spike clamp applied at this read exit
         Vector3d omegaLocal = qCurrent.transformInverse(omegaWorld, new Vector3d());
@@ -80,26 +88,25 @@ public final class AttitudeController {
         }
 
         // desired angular acceleration (rad/s^2), per-axis sign calibration applied
-        Vector3d alpha = new Vector3d();
         if (mode == Mode.HOLD && qTarget != null) {
-            attitudeErrorVector(qCurrent, qTarget, alpha); // alpha := e (rad), reused as scratch
-            alpha.mul(kp);
-            alpha.sub(omegaLocal.mul(kd)); // alpha = kp*e - kd*omega
+            attitudeErrorVector(qCurrent, qTarget, dest);
+            dest.mul(kp).sub(omegaLocal.mul(kd));
         } else if (mode == Mode.RATE && omegaTargetBody != null) {
             // Rate command (M1): stick = target angular velocity, loop drives omega to it.
-            alpha.set(omegaTargetBody).sub(omegaLocal).mul(RATE_KR);
+            dest.set(omegaTargetBody).sub(omegaLocal).mul(RATE_KR);
         } else {
-            alpha.set(omegaLocal).mul(-kd); // pure D damping
+            dest.set(omegaLocal).mul(-kd); // pure D damping
         }
-        alpha.mul(AXIS_SIGN);
+        return dest.mul(AXIS_SIGN);
+    }
 
-        double alphaLen = alpha.length();
-        if (alphaLen > maxAlpha) {
-            alpha.normalize(maxAlpha);
+    /** Limits the magnitude and reports whether the request was saturated. */
+    public static boolean limitAngularAcceleration(Vector3d acceleration, double limit) {
+        if (acceleration.length() > limit) {
+            acceleration.normalize(limit);
+            return true;
         }
-
-        inertia.transform(alpha, dest); // torque = I * alpha
-        return dest;
+        return false;
     }
 
     /**

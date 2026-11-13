@@ -73,6 +73,11 @@ public final class RailgunMountLink implements MountLink {
     }
 
     @Override
+    public @Nullable PreviewLimits previewLimits(@Nullable Object handle) {
+        return RailgunLink.previewLimits(handle);
+    }
+
+    @Override
     public @Nullable EnergyReading energyReading(@Nullable Object handle) {
         if (handle == null || !available()) return null;
         long capacity = RailgunLink.energyCapacity(handle);

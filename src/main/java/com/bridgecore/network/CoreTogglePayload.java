@@ -33,7 +33,9 @@ public record CoreTogglePayload(BlockPos pos, int switchId) implements CustomPac
     public static final int SWITCH_ALTITUDE_FOLLOW = 5;
     public static final int SWITCH_KEYBOARD = 6;
     public static final int SWITCH_HUD_OUTLINE = 7;
-    private static final int SWITCH_COUNT = 8;
+    /** 核心 GUI 解绑导航终端（2026-11-08）：操作员动作，不需要终端在场。 */
+    public static final int SWITCH_UNBIND_TERMINAL = 8;
+    private static final int SWITCH_COUNT = 9;
 
     public static final StreamCodec<FriendlyByteBuf, CoreTogglePayload> STREAM_CODEC = StreamCodec.of(
             (buf, p) -> {
@@ -54,6 +56,9 @@ public record CoreTogglePayload(BlockPos pos, int switchId) implements CustomPac
                         payload.switchId(), context.player().getName().getString());
                 return;
             }
+            // 审查 P1-4：配置写必须来自该核心当前打开的菜单。
+            if (!PayloadGuards.menuOpen(context.player(),
+                    com.bridgecore.menu.BridgeCoreMenu.class, payload.pos())) return;
             if (!(context.player().level().getBlockEntity(payload.pos())
                     instanceof BridgeCoreBlockEntity be)) {
                 return;
@@ -66,6 +71,7 @@ public record CoreTogglePayload(BlockPos pos, int switchId) implements CustomPac
                 case SWITCH_ALTITUDE_FOLLOW -> be.toggleAltitudeFollow();
                 case SWITCH_KEYBOARD -> be.toggleKeyboardChannel();
                 case SWITCH_HUD_OUTLINE -> be.toggleHudOutline();
+                case SWITCH_UNBIND_TERMINAL -> be.clearBoundTerminal();
                 default -> {
                 }
             }

@@ -20,9 +20,8 @@ public final class TurretUnit {
     private final UUID id;
     private String name;
     private final SwivelTurretActuator actuator;
-    /** Weapon-channel membership (P3 武器频道): 0..CHANNEL_COUNT-1, -1 = 未编组
-     *  (ungrouped turrets answer to no channel — neither volley nor auto-fire). */
-    private int channel = -1;
+    /** One bit per group this turret belongs to. */
+    private int groups;
 
     public TurretUnit(UUID id, String name, Runnable markDirty, Supplier<BlockPos> corePos) {
         this.id = id;
@@ -42,14 +41,12 @@ public final class TurretUnit {
         name = n;
     }
 
-    public int channel() {
-        return channel;
-    }
+    public int groups() { return groups; }
 
-    /** Exclusive membership: entering a channel leaves the previous one. */
-    public void setChannel(int ch) {
-        channel = ch;
-    }
+    public boolean belongsTo(int group) { return (groups & WeaponGroups.bit(group)) != 0; }
+
+    public void setGroups(int groups) { this.groups = groups; }
+
 
     public SwivelTurretActuator actuator() {
         return actuator;
@@ -58,15 +55,16 @@ public final class TurretUnit {
     public void save(CompoundTag tag) {
         tag.putUUID("unitId", id);
         tag.putString("unitName", name);
-        tag.putInt("unitChannel", channel);
+        tag.putInt("unitGroups", groups);
         actuator.save(tag);
     }
 
     public static TurretUnit load(CompoundTag tag, Runnable markDirty, Supplier<BlockPos> corePos) {
-        UUID id = tag.hasUUID("unitId") ? tag.getUUID("unitId") : UUID.randomUUID();
+        UUID id = FireControlCoreBlockEntity.hasUuid4(tag, "unitId") ? tag.getUUID("unitId") : UUID.randomUUID();
         String name = tag.contains("unitName") ? tag.getString("unitName") : "炮塔";
         TurretUnit u = new TurretUnit(id, name, markDirty, corePos);
-        if (tag.contains("unitChannel")) u.channel = tag.getInt("unitChannel");
+        u.groups = tag.contains("unitGroups") ? tag.getInt("unitGroups")
+                : WeaponGroups.bit(tag.contains("unitChannel") ? tag.getInt("unitChannel") : -1);
         u.actuator().load(tag);
         return u;
     }

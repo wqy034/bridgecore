@@ -53,7 +53,7 @@ public final class DisplayContexts {
         }
         for (MomentumDistributorBlockEntity pool : CoreDirectory.powerPoolsOf(sub)) {
             totalFe += pool.energy();
-            totalFeCap += MomentumDistributorBlockEntity.CAPACITY;
+            totalFeCap += pool.capacity();
         }
         for (EnergyExtractorBlockEntity ex : CoreDirectory.extractorsOf(sub)) {
             totalFe += ex.buffer();
@@ -62,8 +62,9 @@ public final class DisplayContexts {
         }
         // END from the measured stock decline (see EnduranceEstimator for the
         // why); sampled at 1 Hz off the shared estimator.
-        double endSeconds = endurance.update(totalFe + burnableFe, drawFePerTick,
-                level.getGameTime());
+        double endSeconds = cores.isEmpty()
+                ? endurance.update(totalFe + burnableFe, drawFePerTick, level.getGameTime())
+                : cores.getFirst().enduranceSeconds();
         return new DisplayApp.DisplayContext(true, new Quaterniond(pose.orientation()),
                 pose.position().x(), pose.position().y(), pose.position().z(),
                 sub.latestLinearVelocity.x(), sub.latestLinearVelocity.y(), sub.latestLinearVelocity.z(),

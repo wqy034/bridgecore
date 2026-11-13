@@ -19,6 +19,9 @@ class FireControlMenuActionsTest {
             assertTrue(ids.add(FireControlMenuActions.CADENCE_UP_BASE + row));
             for (int ch = -1; ch < 4; ch++) assertTrue(ids.add(FireControlMenuActions.membership(row, ch)));
         }
+        for (int row = 0; row < FireControlMenuActions.FIXED_GUNS; row++) {
+            for (int ch = -1; ch < 4; ch++) assertTrue(ids.add(FireControlMenuActions.fixedMembership(row, ch)));
+        }
         for (int ch = 0; ch < 4; ch++) {
             assertTrue(ids.add(FireControlMenuActions.CHANNEL_SELECT_BASE + ch));
             assertTrue(ids.add(FireControlMenuActions.CHANNEL_AUTO_BASE + ch));
@@ -32,7 +35,8 @@ class FireControlMenuActionsTest {
     void delayedClicksAfterRosterChangeAreRejected() {
         int[] actions = {0, 7, 102, 104, 4096, 65535,
                 FireControlMenuActions.RECALIBRATE_BASE + 7,
-                FireControlMenuActions.membership(7, 3)};
+                FireControlMenuActions.membership(7, 3),
+                FireControlMenuActions.fixedMembership(FireControlMenuActions.FIXED_GUNS - 1, 3)};
         for (int epoch : new int[]{0, 1, 4095}) for (int action : actions) {
             int encoded = FireControlMenuActions.guarded(action, epoch);
             assertEquals(action, FireControlMenuActions.decodeGuarded(encoded, epoch));
@@ -52,5 +56,10 @@ class FireControlMenuActionsTest {
         assertThrows(IllegalArgumentException.class, () -> FireControlMenuActions.guarded(-1, 0));
         assertThrows(IllegalArgumentException.class, () -> FireControlMenuActions.guarded(131072, 0));
         assertThrows(IllegalArgumentException.class, () -> FireControlMenuActions.guarded(1, 4096));
+        assertThrows(IllegalArgumentException.class, () -> FireControlMenuActions.fixedMembership(-1, 0));
+        assertThrows(IllegalArgumentException.class, () -> FireControlMenuActions.fixedMembership(FireControlMenuActions.FIXED_GUNS, 0));
+        assertThrows(IllegalArgumentException.class, () -> FireControlMenuActions.fixedMembership(0, 4));
+        // The fixed-gun segment starts exactly where the cadence segment ends.
+        assertEquals(FireControlMenuActions.CADENCE_END, FireControlMenuActions.FIXED_CHANNEL_BASE);
     }
 }

@@ -5,14 +5,8 @@ import com.bridgecore.BridgeCoreBlockEntity;
 import com.bridgecore.MomentumDistributorBlockEntity;
 import com.bridgecore.display.DisplayGpuBlockEntity;
 import dan200.computercraft.api.peripheral.PeripheralCapability;
-import net.minecraft.world.level.block.entity.BlockEntity;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.neoforge.capabilities.RegisterCapabilitiesEvent;
-
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.WeakHashMap;
 
 /**
  * CC:Tweaked integration entry point: channel tables and whole-screen displays.
@@ -26,12 +20,6 @@ import java.util.WeakHashMap;
  * this API generation.
  */
 public final class CCIntegration {
-
-    /** One peripheral instance per BE — CC's attach/detach diffing keys on
-     *  peripheral identity, so a fresh instance per lookup would flap. Weak keys:
-     *  dead BEs drop out on GC. */
-    private static final Map<BlockEntity, GenericChannelPeripheral> PERIPHERALS =
-            Collections.synchronizedMap(new WeakHashMap<>());
 
     private CCIntegration() {
     }
@@ -48,28 +36,47 @@ public final class CCIntegration {
         });
     }
 
-    private static CCDisplayPeripheral forDisplay(DisplayGpuBlockEntity be) {
+    // R4-6：check-then-act 加锁——并发能力查询不会各 new 一个外设互相覆盖。
+    private static synchronized CCDisplayPeripheral forDisplay(DisplayGpuBlockEntity be) {
         var level = be.getLevel();
         if (level == null || level.isClientSide || be.isRemoved()) return null;
         if (be.externalSession() instanceof CCDisplayPeripheral peripheral) return peripheral;
-        be.prepareExternalDisplay();
         var server = level.getServer();
         var peripheral = new CCDisplayPeripheral(be,
-                () -> !be.isRemoved() && be.getLevel() == level && level.hasChunkAt(be.getBlockPos())
-                        && level.getBlockEntity(be.getBlockPos()) == be,
+                () -> {
+                    if (be.isRemoved() || be.getLevel() != level || !level.hasChunkAt(be.getBlockPos())
+                            || level.getBlockEntity(be.getBlockPos()) != be) return false;
+                    be.prepareExternalDisplay();
+                    return true;
+                },
                 be::externalContentSelected, server::execute, be::resumeInternalDisplay);
         be.setExternalSession(peripheral);
         return peripheral;
     }
 
-    private static GenericChannelPeripheral forCore(BridgeCoreBlockEntity be) {
-        return PERIPHERALS.computeIfAbsent(be,
-                k -> new GenericChannelPeripheral("bridgecore_core", BridgeCoreChannels.coreChannels(be)));
+    // R10-2（R4-6 回归）：通道侧同样加锁，get-or-create 不许两段无锁。
+    private static synchronized GenericChannelPeripheral forCore(BridgeCoreBlockEntity be) {
+        // R4-3：外设挂在 BE 字段上随 BE 一起死，不再用 WeakHashMap（旧 map 的
+        // value 经 channels lambda 强引用 key（BE），弱键自锁永不回收）。
+        if (be.ccChannelPeripheral() instanceof GenericChannelPeripheral p) return p;
+        var level = be.getLevel();
+        if (level == null || level.isClientSide || be.isRemoved()) return null;
+        var p = new GenericChannelPeripheral("bridgecore_core", BridgeCoreChannels.coreChannels(be),
+                () -> !be.isRemoved() && be.getLevel() == level && level.hasChunkAt(be.getBlockPos())
+                        && level.getBlockEntity(be.getBlockPos()) == be);
+        be.setCcChannelPeripheral(p);
+        return p;
     }
 
-    private static GenericChannelPeripheral forDistributor(MomentumDistributorBlockEntity be) {
-        return PERIPHERALS.computeIfAbsent(be,
-                k -> new GenericChannelPeripheral("bridgecore_distributor",
-                        BridgeCoreChannels.distributorChannels(be)));
+    private static synchronized GenericChannelPeripheral forDistributor(MomentumDistributorBlockEntity be) {
+        if (be.ccChannelPeripheral() instanceof GenericChannelPeripheral p) return p;
+        var level = be.getLevel();
+        if (level == null || level.isClientSide || be.isRemoved()) return null;
+        var p = new GenericChannelPeripheral("bridgecore_distributor",
+                BridgeCoreChannels.distributorChannels(be),
+                () -> !be.isRemoved() && be.getLevel() == level && level.hasChunkAt(be.getBlockPos())
+                        && level.getBlockEntity(be.getBlockPos()) == be);
+        be.setCcChannelPeripheral(p);
+        return p;
     }
 }

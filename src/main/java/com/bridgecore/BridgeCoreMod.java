@@ -1,8 +1,10 @@
 package com.bridgecore;
 
 import com.bridgecore.cc.CCIntegration;
+import com.bridgecore.control.NavigationTestCommand;
 import com.bridgecore.firecontrol.SwivelBearingAxisLock;
 import com.bridgecore.firecontrol.TurretPairing;
+import com.bridgecore.nav.NavWakeProbe;
 import com.bridgecore.network.BCNetworking;
 import com.mojang.logging.LogUtils;
 import net.neoforged.bus.api.IEventBus;
@@ -45,6 +47,8 @@ public class BridgeCoreMod {
         if (ModList.get().isLoaded("computercraft")) {
             CCIntegration.register(modEventBus);
         }
+        NavigationTestCommand.register();
+        NavWakeProbe.register();
         // Fire-control turret pairing clicks reference the aeronautics swivel
         // bearing class — only register when simulated is present (soft dep).
         if (ModList.get().isLoaded("simulated")) {

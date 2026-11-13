@@ -1,0 +1,13 @@
+{
+  "type": "minecraft:crafting_shapeless",
+  "category": "misc",
+  "ingredients": [
+    { "item": "bridgecore:advanced_throughput_card" },
+    { "item": "minecraft:diamond" },
+    { "item": "minecraft:quartz" }
+  ],
+  "result": {
+    "id": "bridgecore:elite_throughput_card",
+    "count": 1
+  }
+}

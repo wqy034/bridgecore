@@ -63,6 +63,8 @@ public final class BridgeCoreChannels {
                         "structure distributor pool capacity, FE"),
                 ChannelDef.read("drawFePerTick", be::drawFePerTick,
                         "smoothed consumption, FE/t"),
+                ChannelDef.read("hasEnergy", () -> be.energyStatus().hasEnergy(),
+                        "structure has spendable energy"),
                 ChannelDef.read("enduranceSeconds", be::enduranceSeconds,
                         "END estimate, s (inf = stock not declining)"),
                 ChannelDef.write("setMode", value -> {
@@ -100,8 +102,9 @@ public final class BridgeCoreChannels {
     public static List<ChannelDef> distributorChannels(MomentumDistributorBlockEntity be) {
         return List.of(
                 ChannelDef.read("poolFe", be::energy, "stored energy, FE"),
-                ChannelDef.read("capacityFe", () -> MomentumDistributorBlockEntity.CAPACITY,
-                        "pool capacity, FE"));
+                ChannelDef.read("capacityFe", be::capacity, "pool capacity, FE"),
+                ChannelDef.read("inputLimitFePerTick", be::maxReceive, "pool input limit, FE/t"),
+                ChannelDef.read("outputLimitFePerTick", be::maxOutput, "ship output limit, FE/t"));
     }
 
     private static ServerSubLevel subOf(BridgeCoreBlockEntity be) {

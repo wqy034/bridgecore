@@ -268,6 +268,13 @@ public class BridgeCoreScreen extends AbstractContainerScreen<BridgeCoreMenu> {
     private void rebuildTabWidgets() {
         clearWidgets();
         java.util.Arrays.fill(hudBoxes, null);
+        if (tab == 0) {
+            // 导航终端解绑（2026-11-08 用户裁决：解绑在核心 GUI，道具侧只管绑定）。
+            addRenderableWidget(Button.builder(Component.translatable("gui.bridgecore.unbind_terminal"),
+                            b -> PacketDistributor.sendToServer(new CoreTogglePayload(
+                                    menu.corePos(), CoreTogglePayload.SWITCH_UNBIND_TERMINAL)))
+                    .bounds(leftPos + SW_X, topPos + 160, SW_W, 16).build());
+        }
         if (tab == 1) {
             for (int i = 0; i < BridgeCoreBlockEntity.GEAR_COUNT; i++) {
                 EditBox box = new EditBox(font, leftPos + GEAR_BOX_X,
@@ -1086,7 +1093,7 @@ public class BridgeCoreScreen extends AbstractContainerScreen<BridgeCoreMenu> {
         //   0.7..2.0    healthy (green)
         //   > 2.0       overdamped (gray, 偏肉)
         double zetaAtt = displayedTune(0) / (2.0 * Math.sqrt(displayedTune(1)));
-        double zetaHov = displayedTune(4) / (2.0 * Math.sqrt(displayedTune(3)));
+        double zetaHov = 0.5 * Math.sqrt(displayedTune(4) / displayedTune(3));
         drawZeta(guiGraphics, "gui.bridgecore.tune_zeta_att", zetaAtt, TUNE_ZETA_ATT_Y);
         drawZeta(guiGraphics, "gui.bridgecore.tune_zeta_hov", zetaHov, TUNE_ZETA_HOV_Y);
     }

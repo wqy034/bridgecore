@@ -2,6 +2,9 @@ package com.bridgecore.menu;
 
 import com.bridgecore.BCRegistry;
 import com.bridgecore.firecontrol.FireControlUiText;
+import com.bridgecore.firecontrol.WeaponGroups;
+import com.bridgecore.firecontrol.SectorArc;
+import com.bridgecore.firecontrol.MacroReadout;
 import com.bridgecore.firecontrol.MountLinks;
 import com.bridgecore.network.FireControlIdentityPayload;
 import dev.ryanhcode.sable.Sable;
@@ -65,8 +68,8 @@ import net.minecraft.world.item.ItemStack;
  * New commands live in {@link FireControlMenuActions}, starting at 65536
  * AFTER the complete legacy arc range. Row order is insertion order.
  *
- * <p>stillValid has no distance check (Sable shipyard vs logical coordinates
- * would always fail); removal is the only invalidation.
+ * <p>stillValid checks the loaded block entity's identity. Menu distance
+ * needs a shared ship-aware policy because shipyard positions are local.
  */
 public class FireControlMenu extends AbstractContainerMenu {
 
@@ -120,9 +123,42 @@ public class FireControlMenu extends AbstractContainerMenu {
     private static final int DATA_ACTIVE_CHANNEL = DATA_CHANNELS + 4 * CHANNEL_STRIDE;
     private static final int DATA_PAIRING = DATA_ACTIVE_CHANNEL + 1;
     private static final int DATA_ROSTER_EPOCH = DATA_PAIRING + 1;
-    private static final int DATA_COUNT = DATA_ROSTER_EPOCH + 1;
+    // Axis guns (3b): per-gun channel / status / idHash / energy / cap / heat /
+    // maxHeat, then the gun count. Appended AFTER every legacy slot.
+    private static final int FIXED_STRIDE = 7;
+    private static final int DATA_FIXED = DATA_ROSTER_EPOCH + 1;
+    private static final int DATA_FIXED_COUNT = DATA_FIXED + FireControlMenuActions.FIXED_GUNS * FIXED_STRIDE;
+    private static final int DATA_GROUP_COUNT = DATA_FIXED_COUNT + 1;
+    private static final int DATA_EXTRA_GROUPS = DATA_GROUP_COUNT + 1;
+    private static final int DATA_MEMBERSHIPS = DATA_EXTRA_GROUPS + (WeaponGroups.MAX - 4) * CHANNEL_STRIDE;
+    private static final int DATA_MACRO_DETAIL = DATA_MEMBERSHIPS + (MAX_TURRETS + FireControlMenuActions.FIXED_GUNS) * 2;
+    private static final int MACRO_DETAIL_STRIDE = 10;
+    private static final int DATA_COUNT = DATA_MACRO_DETAIL + FireControlMenuActions.FIXED_GUNS * MACRO_DETAIL_STRIDE;
 
-    private final FireControlCoreBlockEntity be;
+    private static int groupBase(int group) {
+        return group < 4 ? DATA_CHANNELS + group * CHANNEL_STRIDE
+                : DATA_EXTRA_GROUPS + (group - 4) * CHANNEL_STRIDE;
+    }
+
+    private void setMembership(int row, int mask) {
+        int base = DATA_MEMBERSHIPS + row * 2;
+        data.set(base, (short) mask);
+        data.set(base + 1, (short) (mask >>> 16));
+    }
+
+    public int membership(int row, boolean macro) {
+        int base = DATA_MEMBERSHIPS + (macro ? MAX_TURRETS + row : row) * 2;
+        return (data.get(base) & 0xffff) | (data.get(base + 1) << 16);
+    }
+
+    public boolean belongsTo(int row, boolean macro, int group) {
+        return (membership(row, macro) & WeaponGroups.bit(group)) != 0;
+    }
+
+    public int channelCount() { return Math.max(1, data.get(DATA_GROUP_COUNT)); }
+
+
+    private final @Nullable FireControlCoreBlockEntity be;
     private final SyncData data = new SyncData();
     private final Player viewer;
     private java.util.List<String> operationRoster = java.util.List.of();
@@ -151,19 +187,32 @@ public class FireControlMenu extends AbstractContainerMenu {
                 String weapon = !loaded ? "炮座未加载" : handle == null ? "炮座已移除 / 不支持" :
                         FireControlUiText.weapon(MountLinks.active().gunTypeName(handle));
                 if (MountLinks.active().hasGun(handle)) weapons.merge(weapon, 1, Integer::sum);
-                mounts.add(new FireControlIdentityPayload.Mount(mount.no(), weapon, worldLocation(mount.pos())));
+                mounts.add(new FireControlIdentityPayload.Mount(mount.no(), weapon, worldLocation(mount.pos()),
+                        handle == null ? null : mount.pos()));
             }
             String weapon = weapons.entrySet().stream().map(entry -> entry.getKey()
                     + (entry.getValue() > 1 ? "×" + entry.getValue() : "")).collect(java.util.stream.Collectors.joining("+"));
             if (weapon.isEmpty()) weapon = mounts.isEmpty() ? "未挂载炮座" : unloaded ? "炮座未加载" : "未装配武器";
             BlockPos offset = a.yawOffset();
+            BlockPos yawBlock = a.yawPos();
+            int rightSign = -1;
+            if (yawBlock != null && level.hasChunkAt(yawBlock)) {
+                var state = level.getBlockState(yawBlock);
+                var facing = net.minecraft.world.level.block.state.properties.BlockStateProperties.FACING;
+                if (state.hasProperty(facing) && state.getValue(facing) == net.minecraft.core.Direction.DOWN) rightSign = 1;
+            }
             rows.add(new FireControlIdentityPayload.Turret(unit.id(), unit.name(),
                     weapon, worldLocation(a.yawPos()), worldLocation(a.pitchPos()),
-                    offset == null ? "未知" : offset.getX() + ", " + offset.getY() + ", " + offset.getZ(), mounts));
+                    offset == null ? "未知" : offset.getX() + ", " + offset.getY() + ", " + offset.getZ(), mounts,
+                    a.sectorArc(), yawBlock, rightSign));
         }
         var names = new java.util.ArrayList<String>(4);
-        for (int ch = 0; ch < 4; ch++) names.add(be.channelName(ch));
-        var payload = new FireControlIdentityPayload(containerId, operationEpoch, names, rows);
+        for (int ch = 0; ch < be.channelCount(); ch++) names.add(be.channelName(ch));
+        var guns = new java.util.ArrayList<FireControlIdentityPayload.AxisGun>();
+        for (var gun : be.fixedGuns()) {
+            guns.add(new FireControlIdentityPayload.AxisGun(gun.id(), gun.name(), worldLocation(gun.gunPos())));
+        }
+        var payload = new FireControlIdentityPayload(containerId, operationEpoch, names, rows, guns);
         if (!payload.equals(lastSentIdentity)) {
             PacketDistributor.sendToPlayer(player, payload);
             lastSentIdentity = payload;
@@ -202,7 +251,7 @@ public class FireControlMenu extends AbstractContainerMenu {
         return info == null ? "信息同步中" : info.weapon();
     }
     public String channelName(int ch) {
-        return ch < 0 || ch >= 4 ? "未编组" : receivedIdentity == null
+        return ch < 0 ? "未编组" : receivedIdentity == null || ch >= receivedIdentity.channels().size()
                 ? FireControlUiText.channel(ch) : receivedIdentity.channels().get(ch);
     }
     public @Nullable FireControlIdentityPayload.Mount mountInfo(int row, int slot) {
@@ -213,12 +262,26 @@ public class FireControlMenu extends AbstractContainerMenu {
         return mount.no() == (packed >> 4) ? mount : null;
     }
 
+    /** Axis-gun identity row: same epoch + id-hash cross-check as turrets. */
+    public @Nullable FireControlIdentityPayload.AxisGun fixedGunInfo(int row) {
+        if (receivedIdentity == null || receivedIdentity.epoch() != rosterEpoch()
+                || row < 0 || row >= fixedGunCount() || row >= receivedIdentity.guns().size()) return null;
+        var info = receivedIdentity.guns().get(row);
+        return (info.id().hashCode() & 0x7fff) == fixedGunIdentity(row) ? info : null;
+    }
+    public String fixedGunName(int row) {
+        var info = fixedGunInfo(row);
+        return info == null ? "轴炮(同步中)" : info.name();
+    }
+
     private void refreshOperationRoster() {
         java.util.List<String> next = new java.util.ArrayList<>();
+        next.add(be.activeChannel() + ":" + be.channelCount());
         for (TurretUnit unit : be.turrets()) {
-            next.add(unit.id().toString());
+            next.add(unit.id() + ":" + unit.groups());
             for (var mount : unit.actuator().mounts()) next.add(mount.no() + ":" + mount.pos().asLong());
         }
+        for (var gun : be.fixedGuns()) next.add(gun.id() + ":" + gun.gunPos().asLong() + ":" + gun.groups());
         if (!next.equals(operationRoster)) {
             operationRoster = java.util.List.copyOf(next);
             operationEpoch = (operationEpoch + 1) & FireControlMenuActions.EPOCH_MASK;
@@ -226,7 +289,7 @@ public class FireControlMenu extends AbstractContainerMenu {
     }
 
     /** Server-side constructor. */
-    public FireControlMenu(int windowId, Inventory playerInv, FireControlCoreBlockEntity be) {
+    public FireControlMenu(int windowId, Inventory playerInv, @Nullable FireControlCoreBlockEntity be) {
         super(BCRegistry.FIRE_CONTROL_MENU.get(), windowId);
         this.be = be;
         this.viewer = playerInv.player;
@@ -235,12 +298,16 @@ public class FireControlMenu extends AbstractContainerMenu {
 
     /** Client-side constructor (IMenuTypeExtension factory): extra data = BlockPos. */
     public FireControlMenu(int windowId, Inventory playerInv, FriendlyByteBuf buf) {
-        this(windowId, playerInv,
-                (FireControlCoreBlockEntity) playerInv.player.level().getBlockEntity(buf.readBlockPos()));
+        this(windowId, playerInv, clientCore(playerInv, buf.readBlockPos()));
+    }
+
+    private static @Nullable FireControlCoreBlockEntity clientCore(Inventory inv, BlockPos pos) {
+        return inv.player.level().getBlockEntity(pos) instanceof FireControlCoreBlockEntity core ? core : null;
     }
 
     @Override
     public void broadcastChanges() {
+        if (be == null) return;
         refreshOperationRoster();
         data.set(DATA_ROSTER_EPOCH, operationEpoch);
         int i = 0;
@@ -258,9 +325,10 @@ public class FireControlMenu extends AbstractContainerMenu {
             data.set(base + 6, (int) Math.round(a.pitchMaxDeg()));
             data.set(base + 7, Double.isNaN(a.relYawDeg()) ? REL_UNKNOWN : (int) Math.round(a.relYawDeg() * 10));
             data.set(base + 8, Double.isNaN(a.relPitchDeg()) ? REL_UNKNOWN : (int) Math.round(a.relPitchDeg() * 10));
-            data.set(base + 9, u.channel() >= 0 && be.channelAutoFire(u.channel()) ? 1 : 0);
+            data.set(base + 9, be.commandGroup(u.groups()) >= 0 && be.channelAutoFire(be.commandGroup(u.groups())) ? 1 : 0);
             int extra = DATA_EXTRA + i * EXTRA_STRIDE;
-            data.set(extra, u.channel());
+            data.set(extra, be.commandGroup(u.groups()));
+            setMembership(i, u.groups());
             data.set(extra + 1, a.fireIntervalTicks());
             data.set(extra + 2, be.turretCadenceAdjustable(i) ? 1 : 0);
             var gate = be.gateOf(u.id());
@@ -284,8 +352,9 @@ public class FireControlMenu extends AbstractContainerMenu {
         data.set(0, i);
         data.set(DATA_SKY_FILTER, be.skyFilter() ? 1 : 0);
         data.set(DATA_FOLLOW, be.followActive() ? 1 : 0);
-        for (int ch = 0; ch < FireControlCoreBlockEntity.CHANNEL_COUNT; ch++) {
-            int base = DATA_CHANNELS + ch * CHANNEL_STRIDE;
+        data.set(DATA_GROUP_COUNT, be.channelCount());
+        for (int ch = 0; ch < be.channelCount(); ch++) {
+            int base = groupBase(ch);
             data.set(base, be.channelAutoFire(ch) ? 1 : 0);
             data.set(base + 1, be.channelAutoPromote(ch) ? 1 : 0);
             data.set(base + 2, be.taskOf(ch).mode().ordinal());
@@ -294,7 +363,74 @@ public class FireControlMenu extends AbstractContainerMenu {
         }
         data.set(DATA_ACTIVE_CHANNEL, be.activeChannel());
         data.set(DATA_PAIRING, TurretPairing.hasSession(viewer.getUUID()) ? 1 : 0);
+        int gunRow = 0;
+        for (var gun : be.fixedGuns()) {
+            if (gunRow >= FireControlMenuActions.FIXED_GUNS) break;
+            MacroReadout sample = be.macroReadout(gun);
+            int base = DATA_FIXED + gunRow * FIXED_STRIDE;
+            int detail = DATA_MACRO_DETAIL + gunRow * MACRO_DETAIL_STRIDE;
+            setMembership(MAX_TURRETS + gunRow, gun.groups());
+            data.set(base, be.commandGroup(gun));
+            data.set(base + 1, sample == null ? -1 : sample.hardware());
+            data.set(base + 2, gun.id().hashCode() & 0x7fff);
+            long energy = sample == null ? 0 : sample.energy();
+            long capacity = sample == null ? 0 : sample.capacity();
+            data.set(base + 3, (int) energy);
+            data.set(base + 4, (int) capacity);
+            data.set(base + 5, sample == null ? 0 : sample.heat());
+            data.set(base + 6, sample == null ? 0 : sample.maxHeat());
+            data.set(detail, (int) (energy >>> 32));
+            data.set(detail + 1, (int) (capacity >>> 32));
+            data.set(detail + 2, sample == null ? 0 : sample.aim().gate().ordinal());
+            data.set(detail + 3, sample == null ? -1 : quantize(sample.aim().degrees(), 10));
+            data.set(detail + 4, sample == null ? -1 : quantize(sample.aim().distance(), 1));
+            data.set(detail + 5, sample == null ? -1 : quantize(sample.aim().range(), 1));
+            data.set(detail + 6, sample == null ? 0 : sample.shotCost());
+            data.set(detail + 7, sample == null ? 0 : sample.warmup());
+            data.set(detail + 8, sample == null ? 0 : sample.cooldown());
+            data.set(detail + 9, sample == null ? 0 : sample.phase().ordinal());
+            gunRow++;
+        }
+        data.set(DATA_FIXED_COUNT, gunRow);
         super.broadcastChanges();
+        broadcastIdentity();
+    }
+
+    private static int quantize(double value, int scale) {
+        return value < 0 || !Double.isFinite(value) ? -1
+                : (int) Math.min(Integer.MAX_VALUE, Math.round(value * scale));
+    }
+
+    public void renameGroup(Player player, int group, String name) {
+        if (strikeCore(player) == null) return;
+        if (be.renameChannel(group, name)) broadcastIdentityNow();
+    }
+
+    public @Nullable FireControlCoreBlockEntity strikeCore(Player player) {
+        return player == viewer && player.containerMenu == this && player.isAlive()
+                && !player.isSpectator() && stillValid(player) ? be : null;
+    }
+
+    public void replaceSectorArc(Player player, java.util.UUID turret, SectorArc expected, SectorArc replacement) {
+        if (strikeCore(player) == null) return;
+        for (var unit : be.turrets()) {
+            if (!unit.id().equals(turret) || !unit.actuator().isPaired()) continue;
+            var actuator = unit.actuator();
+            if (actuator.sectorArc().equals(expected)) actuator.setSectorArc(replacement);
+            else player.displayClientMessage(Component.literal("射界已更新，请按最新分区重新编辑"), true);
+            broadcastIdentityNow();
+            return;
+        }
+    }
+
+    public void renameTurret(Player player, java.util.UUID turret, String name) {
+        if (strikeCore(player) == null) return;
+        if (be.renameTurret(turret, name)) broadcastIdentityNow();
+        else player.displayClientMessage(Component.literal("名称无效或本核心已有同名炮塔"), true);
+    }
+
+    private void broadcastIdentityNow() {
+        lastSentIdentity = null;
         broadcastIdentity();
     }
 
@@ -313,7 +449,7 @@ public class FireControlMenu extends AbstractContainerMenu {
 
     @Override
     public boolean clickMenuButton(Player player, int id) {
-        if (be.isRemoved()) return false;
+        if (strikeCore(player) == null) return false;
         if (id >= FireControlMenuActions.GUARDED_BASE && id < FireControlMenuActions.GUARDED_END) {
             refreshOperationRoster();
             int action = FireControlMenuActions.decodeGuarded(id, operationEpoch);
@@ -322,6 +458,45 @@ public class FireControlMenu extends AbstractContainerMenu {
                 return true;
             }
             id = action;
+        }
+        if (id == FireControlMenuActions.GROUP_ADD) {
+            if (be.addChannel()) broadcastChanges();
+            return true;
+        }
+        if (id >= FireControlMenuActions.SECTOR_RESUME_BASE
+                && id < FireControlMenuActions.SECTOR_RESUME_BASE + MAX_TURRETS) {
+            TurretUnit unit = be.turretByIndex(id - FireControlMenuActions.SECTOR_RESUME_BASE);
+            if (unit != null && unit.actuator().isPaired()) {
+                var actuator = unit.actuator();
+                actuator.resumeSectorArc(SectorArc.start((int) Math.round(actuator.pitchMinDeg()),
+                        (int) Math.round(actuator.pitchMaxDeg())));
+                broadcastIdentityNow();
+            }
+            return true;
+        }
+        if (id >= FireControlMenuActions.GROUP_SELECT && id < FireControlMenuActions.GROUP_AUTO) {
+            be.setActiveChannel(id - FireControlMenuActions.GROUP_SELECT);
+            return true;
+        }
+        if (id >= FireControlMenuActions.GROUP_AUTO && id < FireControlMenuActions.GROUP_PROMOTE) {
+            be.toggleChannelAutoFire(id - FireControlMenuActions.GROUP_AUTO);
+            return true;
+        }
+        if (id >= FireControlMenuActions.GROUP_PROMOTE && id < FireControlMenuActions.GROUP_MEMBERSHIP) {
+            be.toggleChannelAutoPromote(id - FireControlMenuActions.GROUP_PROMOTE);
+            return true;
+        }
+        if (id >= FireControlMenuActions.GROUP_MEMBERSHIP && id < FireControlMenuActions.GROUP_END) {
+            int action = id - FireControlMenuActions.GROUP_MEMBERSHIP;
+            int row = action / (WeaponGroups.MAX * 2);
+            int group = (action / 2) % WeaponGroups.MAX;
+            boolean join = (action & 1) != 0;
+            // N2: 互斥拒绝给回执(轴炮与炮塔不能同频道), 不再静默丢弃
+            boolean ok = row < MAX_TURRETS ? be.editTurretGroup(row, group, join)
+                    : be.editFixedGunGroup(row - MAX_TURRETS, group, join);
+            if (!ok) player.sendSystemMessage(Component.literal(
+                    "[火控核心] 编组未生效:轴炮与炮塔不能编入同一频道(打击方式不同)"));
+            return true;
         }
         if (id >= FireControlMenuActions.RECALIBRATE_BASE && id < FireControlMenuActions.CHANNEL_SELECT_BASE) {
             TurretUnit u = be.turretByIndex(id - FireControlMenuActions.RECALIBRATE_BASE);
@@ -344,13 +519,24 @@ public class FireControlMenu extends AbstractContainerMenu {
         }
         if (id >= FireControlMenuActions.TURRET_CHANNEL_BASE && id < FireControlMenuActions.CADENCE_DOWN_BASE) {
             int rel = id - FireControlMenuActions.TURRET_CHANNEL_BASE;
-            be.setTurretChannel(rel / 5, rel % 5 - 1);
+            if (!be.setTurretChannel(rel / 5, rel % 5 - 1)) {
+                player.sendSystemMessage(Component.literal(
+                        "[火控核心] 编组未生效:轴炮与炮塔不能编入同一频道(打击方式不同)"));
+            }
             return true;
         }
-        if (id >= FireControlMenuActions.CADENCE_DOWN_BASE && id < FireControlMenuActions.END) {
+        if (id >= FireControlMenuActions.CADENCE_DOWN_BASE && id < FireControlMenuActions.CADENCE_END) {
             boolean slower = id < FireControlMenuActions.CADENCE_UP_BASE;
             int row = id - (slower ? FireControlMenuActions.CADENCE_DOWN_BASE : FireControlMenuActions.CADENCE_UP_BASE);
             if (be.turretCadenceAdjustable(row)) be.cycleFireInterval(row, slower ? 1 : -1);
+            return true;
+        }
+        if (id >= FireControlMenuActions.FIXED_CHANNEL_BASE && id < FireControlMenuActions.END) {
+            int rel = id - FireControlMenuActions.FIXED_CHANNEL_BASE;
+            if (!be.setFixedGunChannel(rel / 5, rel % 5 - 1)) {
+                player.sendSystemMessage(Component.literal(
+                        "[火控核心] 编组未生效:轴炮与炮塔不能编入同一频道(打击方式不同)"));
+            }
             return true;
         }
         if (id >= 0 && id < MAX_TURRETS) {
@@ -397,7 +583,7 @@ public class FireControlMenu extends AbstractContainerMenu {
         if (id >= FIRE_TOGGLE_BASE && id < FIRE_TOGGLE_BASE + MAX_TURRETS) {
             TurretUnit u = be.toggleAutoFire(id - FIRE_TOGGLE_BASE);
             if (u != null) {
-                int ch = u.channel();
+                int ch = be.commandGroup(u.groups());
                 player.sendSystemMessage(Component.literal("[火控核心] "
                         + be.channelName(ch) + "(" + u.name() + ") 自动开火: "
                         + (be.channelAutoFire(ch) ? "开" : "关")));
@@ -512,17 +698,55 @@ public class FireControlMenu extends AbstractContainerMenu {
     public int identity(int row) { return data.get(DATA_EXTRA + row * EXTRA_STRIDE + 4); }
     public boolean paired(int row) { return data.get(DATA_EXTRA + row * EXTRA_STRIDE + 5) != 0; }
     public int activeChannel() { return data.get(DATA_ACTIVE_CHANNEL); }
-    public boolean channelAuto(int ch) { return data.get(DATA_CHANNELS + ch * CHANNEL_STRIDE) != 0; }
-    public boolean channelPromote(int ch) { return data.get(DATA_CHANNELS + ch * CHANNEL_STRIDE + 1) != 0; }
-    public int channelMode(int ch) { return data.get(DATA_CHANNELS + ch * CHANNEL_STRIDE + 2); }
-    public int channelSource(int ch) { return data.get(DATA_CHANNELS + ch * CHANNEL_STRIDE + 3); }
-    public boolean promoteSuppressed(int ch) { return data.get(DATA_CHANNELS + ch * CHANNEL_STRIDE + 4) != 0; }
+    public boolean channelAuto(int ch) { return data.get(groupBase(ch)) != 0; }
+    public boolean channelPromote(int ch) { return data.get(groupBase(ch) + 1) != 0; }
+    public int channelMode(int ch) { return data.get(groupBase(ch) + 2); }
+    public int channelSource(int ch) { return data.get(groupBase(ch) + 3); }
+    public boolean promoteSuppressed(int ch) { return data.get(groupBase(ch) + 4) != 0; }
     public int rosterEpoch() { return data.get(DATA_ROSTER_EPOCH); }
     public boolean pairingActive() { return data.get(DATA_PAIRING) != 0; }
 
+    public int fixedGunCount() { return data.get(DATA_FIXED_COUNT); }
+    public int fixedGunChannel(int row) { return data.get(DATA_FIXED + row * FIXED_STRIDE); }
+    public int fixedGunStatus(int row) { return data.get(DATA_FIXED + row * FIXED_STRIDE + 1); }
+    public int fixedGunIdentity(int row) { return data.get(DATA_FIXED + row * FIXED_STRIDE + 2); }
+    private int macroDetail(int row, int offset) {
+        return data.get(DATA_MACRO_DETAIL + row * MACRO_DETAIL_STRIDE + offset);
+    }
+    public long fixedGunEnergy(int row) {
+        return ((long) macroDetail(row, 0) << 32)
+                | Integer.toUnsignedLong(data.get(DATA_FIXED + row * FIXED_STRIDE + 3));
+    }
+    public long fixedGunEnergyCap(int row) {
+        return ((long) macroDetail(row, 1) << 32)
+                | Integer.toUnsignedLong(data.get(DATA_FIXED + row * FIXED_STRIDE + 4));
+    }
+    public MacroReadout.Aim fixedGunAim(int row) {
+        var gates = MacroReadout.Gate.values();
+        int state = macroDetail(row, 2);
+        int angle = macroDetail(row, 3);
+        return new MacroReadout.Aim(state >= 0 && state < gates.length ? gates[state] : MacroReadout.Gate.UNKNOWN,
+                angle < 0 ? -1 : angle / 10.0, macroDetail(row, 4), macroDetail(row, 5));
+    }
+    public MacroReadout.Phase fixedGunPhase(int row) {
+        var phases = MacroReadout.Phase.values();
+        int state = macroDetail(row, 9);
+        return state >= 0 && state < phases.length ? phases[state] : MacroReadout.Phase.UNKNOWN;
+    }
+    public String fixedGunReason(int row) {
+        return fixedGunAim(row).label(fixedGunStatus(row), fixedGunPhase(row));
+    }
+    public int fixedGunShotCost(int row) { return macroDetail(row, 6); }
+    public int fixedGunWarmup(int row) { return macroDetail(row, 7); }
+    public int fixedGunCooldown(int row) { return macroDetail(row, 8); }
+    public int fixedGunHeat(int row) { return data.get(DATA_FIXED + row * FIXED_STRIDE + 5); }
+    public int fixedGunMaxHeat(int row) { return data.get(DATA_FIXED + row * FIXED_STRIDE + 6); }
+
     @Override
     public boolean stillValid(Player player) {
-        return !be.isRemoved();
+        var level = be == null ? null : be.getLevel();
+        return level != null && level == player.level() && !be.isRemoved()
+                && level.hasChunkAt(be.getBlockPos()) && level.getBlockEntity(be.getBlockPos()) == be;
     }
 
     @Override

@@ -85,6 +85,8 @@ public class DisplayGpuBlockEntity extends BlockEntity implements DisplayContent
     private final List<DisplayClickListener> clickListeners = new ArrayList<>();
     /** 0 idle, 1 sync pass queued/running, 2 written to while syncing. */
     private int syncState;
+    private List<ServerPlayer> lastRecipients = List.of();
+    private long nextFullSyncTick;
 
     private int tilesX;
     private int tilesY;
@@ -113,13 +115,16 @@ public class DisplayGpuBlockEntity extends BlockEntity implements DisplayContent
      *  apps keep their own state (click maps, smoothed values) across frames. */
     private final Map<String, DisplayApp> appInstances = new HashMap<>();
     // No optional-mod class references cross this boundary. Lease/frame are transient, never NBT.
-    private ExternalDisplaySession externalSession;
+    private volatile ExternalDisplaySession externalSession;
     private boolean resumeInternalRequested;
     private boolean externalSyncPending;
     public boolean externalContentSelected() { return DisplayApps.CC_MODE.equals(appId); }
     public ExternalDisplaySession externalSession() { return externalSession; }
     public void setExternalSession(ExternalDisplaySession session) { externalSession = session; }
-    public void prepareExternalDisplay() { getMonitors(false); }
+    public void prepareExternalDisplay() {
+        // Called by CC's main-thread invocation, never by capability lookup.
+        if (monitors == null) reconnect();
+    }
     public void resumeInternalDisplay() { resumeInternalRequested = true; externalSyncPending = false; }
     private boolean externalActive() { return externalSession != null && externalSession.isActive(); }
 
@@ -343,13 +348,25 @@ public class DisplayGpuBlockEntity extends BlockEntity implements DisplayContent
         if (level instanceof ServerLevel serverLevel) {
             double[] center = logicalCenter(level, worldPosition);
             double cx = center[0], cy = center[1], cz = center[2];
+            double syncRadius = syncRadius(level, worldPosition, center);
+            double radiusSquared = syncRadius * syncRadius;
+            var recipients = serverLevel.getPlayers(player -> player.distanceToSqr(cx, cy, cz) < radiusSquared);
+            var previous = lastRecipients;
+            lastRecipients = recipients;
+            long tick = level.getGameTime();
+            // Ground tiles receive their saved slice through the chunk update tag.
+            // Ship plot chunks may be tracked separately from the frame recipients.
+            boolean refresh = tick >= nextFullSyncTick
+                    && Sable.HELPER.getContaining(level, worldPosition) instanceof ServerSubLevel;
+            if (refresh) nextFullSyncTick = tick + 100 + Math.floorMod(worldPosition.asLong(), 20);
+            var joining = refresh ? recipients : recipients.stream().filter(player -> !previous.contains(player)).toList();
             for (TileSlot slot : mons) {
                 int[] fresh = separateIntArray(buffer, slot.col(), slot.row(), tileRes);
                 int[] old = slot.tile().setSlice(fresh, tileRes);
-                if (!Arrays.equals(old, fresh)) {
-                    PacketDistributor.sendToPlayersNear(serverLevel, null, cx, cy, cz, SYNC_RADIUS,
-                            new DisplayTileSyncPayload(slot.tile().getBlockPos(), tileRes, fresh));
-                }
+                var viewers = Arrays.equals(old, fresh) ? joining : recipients;
+                if (viewers.isEmpty()) continue;
+                var payload = new DisplayTileSyncPayload(slot.tile().getBlockPos(), tileRes, fresh);
+                for (var viewer : viewers) PacketDistributor.sendToPlayer(viewer, payload);
             }
         }
         boolean exec;
@@ -400,11 +417,11 @@ public class DisplayGpuBlockEntity extends BlockEntity implements DisplayContent
     }
 
     /**
-     * Array semantics: flood-collect every connected, same-facing, claimable
+     * Array semantics: flood-collect nearby connected, same-facing, claimable
      * tile starting at the seed (4-neighborhood in the screen plane via
      * getOffset; foreign-owned tiles are opaque obstacles, not traversed),
      * rasterize the set onto its grid bounding box, then take the LARGEST
-     * ALL-FILLED RECTANGLE (histogram + monotone stack). A row or column short
+     * ALL-FILLED RECTANGLE within the configured side limit. A row or column short
      * one tile is dropped whole instead of shrinking the screen to the shortest
      * run; holes are routed around; tiles outside the chosen rect stay
      * unclaimed (or are released by the reconnect diff).
@@ -428,17 +445,18 @@ public class DisplayGpuBlockEntity extends BlockEntity implements DisplayContent
         Deque<Cell> queue = new ArrayDeque<>();
         queue.add(new Cell(seed, 0, 0));
         visited.add(seed.getBlockPos());
-        int visitCap = maxTiles * maxTiles;
         while (!queue.isEmpty()) {
             Cell c = queue.poll();
             cells.add(c);
-            if (cells.size() >= visitCap) continue; // stop expanding: pathological wall guard
             for (int[] d : GRID_DELTAS) {
+                int x = c.gx() + d[0], y = c.gy() + d[1];
+                // Search one screen width in each direction from the seed.
+                if (Math.abs(x) > maxTiles || Math.abs(y) > maxTiles) continue;
                 BlockPos np = c.tile().getOffset(d[0], d[1], dir);
                 if (visited.add(np) && level.hasChunkAt(np)
                         && level.getBlockEntity(np) instanceof DisplayTileBlockEntity t
                         && t.getDirection() == dir && isClaimable(t)) {
-                    queue.add(new Cell(t, c.gx() + d[0], c.gy() + d[1]));
+                    queue.add(new Cell(t, x, y));
                 }
             }
         }
@@ -452,11 +470,6 @@ public class DisplayGpuBlockEntity extends BlockEntity implements DisplayContent
         }
         int gridW = maxGx - minGx + 1;
         int gridH = maxGy - minGy + 1;
-        if (gridW > maxTiles || gridH > maxTiles) {
-            error = ERROR_SCREEN_TOO_BIG;
-            resetSurface();
-            return Collections.emptyList();
-        }
         boolean[][] filled = new boolean[gridH][gridW]; // [row from bottom][col]
         for (Cell c : cells) {
             filled[c.gy() - minGy][c.gx() - minGx] = true;
@@ -475,16 +488,17 @@ public class DisplayGpuBlockEntity extends BlockEntity implements DisplayContent
             for (int c = 0; c <= gridW; c++) {
                 int h = c == gridW ? 0 : heights[c];
                 while (sp >= 0 && heights[stack[sp]] > h) {
-                    int height = heights[stack[sp--]];
+                    int runHeight = heights[stack[sp--]];
+                    int height = Math.min(maxTiles, runHeight);
                     int left = sp >= 0 ? stack[sp] + 1 : 0;
-                    int right = c - 1;
-                    int bottom = r - height + 1;
+                    int right = Math.min(c - 1, left + maxTiles - 1);
+                    int bottom = r - runHeight + 1;
                     int area = (right - left + 1) * height;
                     if (area > bestArea || (area == bestArea && (left < bx0
                             || (left == bx0 && (bottom < by0
                             || (bottom == by0 && right - left > bx1 - bx0)))))) {
                         bestArea = area;
-                        bx0 = left; by0 = bottom; bx1 = right; by1 = r;
+                        bx0 = left; by0 = bottom; bx1 = right; by1 = bottom + height - 1;
                     }
                 }
                 stack[++sp] = c;
@@ -518,6 +532,8 @@ public class DisplayGpuBlockEntity extends BlockEntity implements DisplayContent
             int gy = c.gy() - minGy;
             if (gx >= bx0 && gx <= bx1 && gy >= by0 && gy <= by1) {
                 mons.add(new TileSlot(c.tile().connect(worldPosition), gx - bx0, by1 - gy));
+            } else if (worldPosition.equals(c.tile().gpuPos())) {
+                releaseTile(c.tile());
             }
         }
         return mons;
@@ -624,7 +640,9 @@ public class DisplayGpuBlockEntity extends BlockEntity implements DisplayContent
                 kept.add(slot.tile());
             }
             for (TileSlot slot : old) {
-                if (!kept.contains(slot.tile()) && worldPosition.equals(slot.tile().gpuPos())) {
+                var pos = slot.tile().getBlockPos();
+                if (!kept.contains(slot.tile()) && worldPosition.equals(slot.tile().gpuPos())
+                        && level.hasChunkAt(pos) && level.getBlockEntity(pos) == slot.tile()) {
                     releaseTile(slot.tile());
                 }
             }
@@ -651,7 +669,9 @@ public class DisplayGpuBlockEntity extends BlockEntity implements DisplayContent
         if (externalSession != null) { externalSession.close(); externalSession = null; }
         if (monitors != null) {
             for (TileSlot slot : monitors) {
-                if (worldPosition.equals(slot.tile().gpuPos())) {
+                var pos = slot.tile().getBlockPos();
+                if (worldPosition.equals(slot.tile().gpuPos()) && level != null
+                        && level.hasChunkAt(pos) && level.getBlockEntity(pos) == slot.tile()) {
                     releaseTile(slot.tile());
                 }
             }
@@ -689,12 +709,21 @@ public class DisplayGpuBlockEntity extends BlockEntity implements DisplayContent
         return new double[]{pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5};
     }
 
+    /** 2026-11-05: sync radius follows the structure's world AABB (same
+     *  big-hull fix as HudScreenBlockEntity); ground controllers keep 64. */
+    private static double syncRadius(Level level, BlockPos pos, double[] c) {
+        if (Sable.HELPER.getContaining(level, pos) instanceof ServerSubLevel sub) {
+            return com.bridgecore.ShipPairing.worldSyncRadius(sub, c[0], c[1], c[2]);
+        }
+        return SYNC_RADIUS;
+    }
+
     /** Tell nearby clients to drop the cached texture for a tile position. */
     static void broadcastClear(Level level, BlockPos pos) {
         if (level instanceof ServerLevel serverLevel) {
             double[] c = logicalCenter(level, pos);
-            PacketDistributor.sendToPlayersNear(serverLevel, null, c[0], c[1], c[2], SYNC_RADIUS,
-                    DisplayTileSyncPayload.clearOf(pos));
+            PacketDistributor.sendToPlayersNear(serverLevel, null, c[0], c[1], c[2],
+                    syncRadius(level, pos, c), DisplayTileSyncPayload.clearOf(pos));
         }
     }
 
@@ -721,6 +750,16 @@ public class DisplayGpuBlockEntity extends BlockEntity implements DisplayContent
                 return;
             }
         }
+    }
+
+    /** Validate a persisted claim after the first server-side scan. */
+    boolean validateTileClaim(DisplayTileBlockEntity tile) {
+        if (monitors == null || monitorsDirty) return false;
+        for (TileSlot slot : monitors) {
+            if (slot.tile() == tile) return true;
+        }
+        releaseTile(tile);
+        return true;
     }
 
     // ---- introspection -----------------------------------------------------------

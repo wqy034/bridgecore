@@ -5,7 +5,7 @@ public final class FireControlUiText {
     private FireControlUiText() {}
 
     public static String channel(int ch) {
-        return ch >= 0 && ch < 4 ? "频道" + "一二三四".charAt(ch) : "未编组";
+        return ch < 0 ? "未编组" : ch < 4 ? "频道" + "一二三四".charAt(ch) : "编组 " + (ch + 1);
     }
 
     public static String weapon(String type) {

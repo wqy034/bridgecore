@@ -77,6 +77,11 @@ public interface MountLink {
     /** Live muzzle velocity, m/s (0 when absent/NONE). */
     double muzzleVelocity(@Nullable Object handle);
 
+    /** Limits exposed by the backing weapon. A positive beam range is a direct-fire estimate. */
+    record PreviewLimits(int lifetimeTicks, double beamRange) {}
+
+    default @Nullable PreviewLimits previewLimits(@Nullable Object handle) { return null; }
+
     /** Optional read-only FE telemetry. Unsupported weapons return null,
      * distinct from a supported empty store (available=0, capacity>0). */
     record EnergyReading(long available, long capacity) {}

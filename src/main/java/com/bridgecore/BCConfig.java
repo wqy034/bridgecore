@@ -26,6 +26,13 @@ public final class BCConfig {
      *  no live switching. */
     public static final ModConfigSpec.EnumValue<HudDigitFont> HUD_DIGIT_FONT;
 
+    /** Base distributor capacity before cards, FE. */
+    public static final ModConfigSpec.IntValue POOL_CAPACITY;
+    /** Base per-block charge and flight output ceilings before cards, FE/t. */
+    public static final ModConfigSpec.IntValue POOL_MAX_RECEIVE;
+    public static final ModConfigSpec.IntValue POOL_MAX_OUTPUT;
+    public static final ModConfigSpec.IntValue UNSUPERVISED_CRUISE_RANGE;
+
     /** Selectable digit fonts for the HUD big-number readouts; ordinals must
      *  never be persisted (name-based on the wire/NBT nowhere — config only). */
     public enum HudDigitFont {
@@ -67,6 +74,22 @@ public final class BCConfig {
                         "canvas renders on the server, so this is a server config; takes",
                         "effect on the next world load, no live switching.")
                 .defineEnum("digitFont", HudDigitFont.RAJDHANI);
+        BUILDER.pop();
+        BUILDER.push("energy");
+        POOL_CAPACITY = BUILDER
+                .comment("Distributor capacity before cards, in FE.")
+                .defineInRange("basePoolCapacity", 250_000, 1_000, 1_000_000_000);
+        POOL_MAX_RECEIVE = BUILDER
+                .comment("Distributor input before cards, in FE/t. Shared by all incoming sources.")
+                .defineInRange("basePoolInput", 2_500, 1, 1_000_000_000);
+        POOL_MAX_OUTPUT = BUILDER
+                .comment("Distributor flight output before cards, in FE/t. Shared by all cores.")
+                .defineInRange("basePoolOutput", 12_000, 1, 1_000_000_000);
+        BUILDER.pop();
+        BUILDER.push("navigation");
+        UNSUPERVISED_CRUISE_RANGE = BUILDER
+                .comment("Maximum cruise distance in blocks when no player travels with the ship.")
+                .defineInRange("unsupervisedCruiseRange", 256, 32, 4096);
         BUILDER.pop();
         SPEC = BUILDER.build();
     }

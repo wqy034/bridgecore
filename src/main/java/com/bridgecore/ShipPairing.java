@@ -21,7 +21,7 @@ import org.jetbrains.annotations.Nullable;
  * the ship-local frame the pose maps to world, which IS the blocks' coordinate
  * space).
  */
-final class ShipPairing {
+public final class ShipPairing {
     /** Bench-core fallback: max core<->source distance, blocks. */
     static final double PAIR_RANGE = 32.0;
     /** Structured ship: pair inside the structure's bounding box plus this
@@ -54,6 +54,18 @@ final class ShipPairing {
         BoundingBox3ic bb = sub.getPlot().getBoundingBox();
         return new AABB(bb.minX(), bb.minY(), bb.minZ(),
                 bb.maxX() + 1.0, bb.maxY() + 1.0, bb.maxZ() + 1.0);
+    }
+
+    /** Canvas/frame sync radius (2026-11-05 正式修复): players anywhere near a
+     *  big hull must receive the HUD/display packets, not just within 64 blocks
+     *  of the logical center. Radius = max logical-center→AABB-corner distance
+     *  + 16 margin, floored at 64 (bench/small ships keep the old behavior). */
+    public static double worldSyncRadius(ServerSubLevel sub, double cx, double cy, double cz) {
+        AABB bb = worldBounds(sub);
+        double dx = Math.max(Math.abs(bb.minX - cx), Math.abs(bb.maxX - cx));
+        double dy = Math.max(Math.abs(bb.minY - cy), Math.abs(bb.maxY - cy));
+        double dz = Math.max(Math.abs(bb.minZ - cz), Math.abs(bb.maxZ - cz));
+        return Math.max(64.0, Math.sqrt(dx * dx + dy * dy + dz * dz) + 16.0);
     }
 
     private ShipPairing() {

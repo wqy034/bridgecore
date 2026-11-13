@@ -23,6 +23,7 @@ import net.minecraft.world.level.block.state.BlockState;
  */
 public class DisplayTileBlockEntity extends BlockEntity {
     private BlockPos gpuPos;
+    private boolean checkLoadedClaim, claimScanRequested;
     private int[] slice = new int[0];
     private int width;
 
@@ -58,6 +59,7 @@ public class DisplayTileBlockEntity extends BlockEntity {
             this.gpuPos = gpuPos;
             setChanged();
         }
+        checkLoadedClaim = false;
         return this;
     }
 
@@ -65,11 +67,38 @@ public class DisplayTileBlockEntity extends BlockEntity {
      *  DisplayGpuBlockEntity.releaseTile, which also wipes the slice and clears
      *  the clients' cached texture. */
     public void disconnect() {
+        checkLoadedClaim = false;
         if (this.gpuPos != null) { this.gpuPos = null; setChanged(); }
     }
 
     public BlockPos gpuPos() {
         return gpuPos;
+    }
+
+    void validateLoadedClaim() {
+        if (!checkLoadedClaim || gpuPos == null || level == null) return;
+        if ((level.getGameTime() + worldPosition.asLong()) % 20 != 0 || !level.hasChunkAt(gpuPos)) return;
+        if (level.getBlockEntity(gpuPos) instanceof DisplayGpuBlockEntity gpu) {
+            if (!claimScanRequested) {
+                claimScanRequested = true;
+                gpu.markMonitorsDirty();
+                return;
+            }
+            checkLoadedClaim = !gpu.validateTileClaim(this);
+        } else {
+            disconnect();
+            setSlice(new int[0], 0);
+            DisplayGpuBlockEntity.broadcastClear(level, worldPosition);
+        }
+    }
+
+    @Override
+    public void onLoad() {
+        super.onLoad();
+        if (level != null && level.isClientSide && width > 0
+                && com.bridgecore.client.DisplayTileTextureCache.get(getBlockPos()) == null) {
+            com.bridgecore.client.DisplayTileTextureCache.update(getBlockPos(), width, slice);
+        }
     }
 
     /** Server side: store the slice the GPU cut for us (dirty-check reference and
@@ -132,9 +161,9 @@ public class DisplayTileBlockEntity extends BlockEntity {
     @Override
     protected void loadAdditional(CompoundTag tag, HolderLookup.Provider registries) {
         super.loadAdditional(tag, registries);
-        if (tag.contains("gpu")) {
-            gpuPos = BlockPos.of(tag.getLong("gpu"));
-        }
+        gpuPos = tag.contains("gpu") ? BlockPos.of(tag.getLong("gpu")) : null;
+        checkLoadedClaim = gpuPos != null;
+        claimScanRequested = false;
         if (tag.contains("p") || tag.contains("s")) {
             width = tag.getShort("w");
             try {
@@ -142,11 +171,14 @@ public class DisplayTileBlockEntity extends BlockEntity {
                 // The old raw array is read only for legacy update tags, never written.
                 slice = tag.contains("p") ? DisplayPixelCodec.decode(tag.getByteArray("p"), width * width) : tag.getIntArray("s");
                 if (slice.length != width * width) throw new IllegalArgumentException("Invalid display slice");
+                if (!tag.contains("p")) {
+                    for (int i = 0; i < slice.length; i++) slice[i] |= 0xff000000;
+                }
             } catch (IllegalArgumentException e) {
                 width = 0; slice = new int[0];
                 com.bridgecore.BridgeCoreMod.LOGGER.warn("Ignoring malformed initial display slice at {}", worldPosition);
             }
-            if (net.neoforged.fml.loading.FMLEnvironment.dist.isClient()) {
+            if (level != null && level.isClientSide) {
                 if (width > 0) com.bridgecore.client.DisplayTileTextureCache.update(getBlockPos(), width, slice);
                 else com.bridgecore.client.DisplayTileTextureCache.remove(getBlockPos());
             }

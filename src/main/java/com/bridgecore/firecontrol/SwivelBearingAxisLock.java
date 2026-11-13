@@ -186,6 +186,12 @@ public final class SwivelBearingAxisLock {
         /** First-pin fuse state: the 64m sanity check runs once per pending
          *  period (continuous pinning afterwards moves sub-mm per substep). */
         boolean pinFuseChecked;
+        /** R2-1 handback hold: after a lapse we keep pinning the child's CURRENT
+         *  pose until the native joint handle is observed again (the BE-tick
+         *  reattach is 20 Hz, so without this there is an unheld window of up
+         *  to one server tick). Capped at 20 ticks as a failsafe. */
+        boolean handbackHold;
+        long handbackSinceTick;
 
         Binding(ServerLevel level, BlockPos pos, UUID childId,
                 Vector3d axisLocalParent, Vector3d anchorLocalParent, Vector3d pivotLocalChild) {
@@ -310,7 +316,11 @@ public final class SwivelBearingAxisLock {
             if (b == null) return; // not assembled / ground — native servo meanwhile
         }
         if (!b.claimed && level.getGameTime() < b.refuseCooldownUntil) return; // fuse cooldown — native servo holds
-        b.lastHeartbeat = level.getGameTime();
+        renewClaim(b, sign);
+    }
+
+    private static void renewClaim(Binding b, int sign) {
+        b.lastHeartbeat = b.level.getGameTime();
         int s = sign >= 0 ? 1 : -1;
         if (b.claimed && !b.baselinePending && b.sign != s) {
             rebase(b, currentRegister(b)); // sign flip mid-run: rebaseline, no jump
@@ -318,6 +328,7 @@ public final class SwivelBearingAxisLock {
         b.sign = s;
         if (!b.claimed) {
             b.claimed = true;
+            b.handbackHold = false; // a fresh claim cancels any handback hold
             // Capture-at-claim (BearingStabilizer methodology, 2026-10-06
             // redesign; pending-pin added 2026-10-28 after the recalibration
             // 飞头): the baseline is captured at the first rotationally-still
@@ -328,7 +339,7 @@ public final class SwivelBearingAxisLock {
             // back to the register and thereby satisfies the stillness gate.
             // There is no window in which nobody holds the joint.
             b.baselinePending = true;
-            b.pendingSinceTick = level.getGameTime();
+            b.pendingSinceTick = b.lastHeartbeat;
             b.pendingTwist = Double.NaN;
             b.pendingStillTicks = 0;
             b.pinFuseChecked = false;
@@ -395,6 +406,14 @@ public final class SwivelBearingAxisLock {
         Binding b = REGISTRY.get(new Key(level.dimension(), pos));
         return b != null && b.claimed && b.decoupleReady
                 && level.getGameTime() - b.lastHeartbeat <= HEARTBEAT_TOLERANCE_TICKS;
+    }
+
+    /** Register value corresponding to a measured physical twist while takeover owns the joint. */
+    static double registerAtTwist(ServerLevel level, BlockPos pos, double measuredTwist) {
+        Binding b = REGISTRY.get(new Key(level.dimension(), pos));
+        if (b == null || !b.claimed || !b.decoupleReady || b.baselinePending
+                || level.getGameTime() - b.lastHeartbeat > HEARTBEAT_TOLERANCE_TICKS) return Double.NaN;
+        return b.register0 + b.sign * GimbalMath.wrapDeg(measuredTwist - b.baselineTwist);
     }
 
     private static double currentRegister(Binding b) {
@@ -543,7 +562,30 @@ public final class SwivelBearingAxisLock {
         ServerSubLevel parent = parentOf(b);
         ServerSubLevel child = childOf(b);
         if (parent == null || child == null) return false;
-        if (!b.claimed) return true; // registered, unclaimed: native servo drives
+        return enforceBound(b, be, parent, child);
+    }
+
+    private static boolean enforceBound(Binding b, SwivelBearingBlockEntity be, ServerSubLevel parent, ServerSubLevel child) {
+        if (!b.claimed) {
+            // R2-1: handback hold — keep pinning the child's CURRENT pose until
+            // the native joint handle exists again. The native reattach runs on
+            // the 20 Hz BE tick, so a plain "claimed=false" left up to one whole
+            // server tick with NO constraint holder (free fall + snap-back).
+            if (b.handbackHold) {
+                var handle = ((SwivelBearingAccessorMixin) be).bridgecore$getHandle();
+                if (handle != null) {
+                    b.handbackHold = false; // native constraint is back — stop holding
+                } else if (b.level.getGameTime() - b.handbackSinceTick > 20) {
+                    b.handbackHold = false;
+                    BridgeCoreMod.LOGGER.warn(
+                            "[axislock] handback hold on bearing@{} expired (20t) without a native joint",
+                            b.pos.toShortString());
+                } else {
+                    holdCurrentPose(b, child);
+                }
+            }
+            return true; // registered, unclaimed: native servo drives
+        }
         if (b.level.getGameTime() - b.lastHeartbeat > HEARTBEAT_TOLERANCE_TICKS) {
             b.claimed = false;
             b.decoupleReady = false;
@@ -559,6 +601,15 @@ public final class SwivelBearingAxisLock {
                 double hold = b.register0
                         + b.sign * GimbalMath.wrapDeg(liveTwistDeg(b, parent, child) - b.baselineTwist);
                 ((SwivelBearingAccessorMixin) be).bridgecore$setTargetAngleDegrees(GimbalMath.norm360(hold));
+                // R2-2: the direct write only guarantees continuity; wake BOTH
+                // islands so the native servo refreshes with the new target on
+                // its next BE tick. The full official write sequence
+                // (coefficients/setChanged) is server-thread business and is
+                // deliberately NOT replicated on the physics thread.
+                wakeIslands(b.level, be);
+                // R2-1: hold the current pose until the native joint is back.
+                b.handbackHold = true;
+                b.handbackSinceTick = b.level.getGameTime();
             }
             return true; // keep registration; checkPersistence re-attaches the constraint
         }
@@ -708,5 +759,28 @@ public final class SwivelBearingAxisLock {
         pipeline.resetVelocity(child); // teleport-to ≠ zero velocity: kill the drift twice
         suppress(be, b); // native may have re-attached since the last substep
         return true;
+    }
+
+    /** R2-1 handback hold: teleport the child to its CURRENT logical pose
+     *  (zero motion) with velocities killed both sides of the write. */
+    private static void holdCurrentPose(Binding b, ServerSubLevel child) {
+        var pipeline = SubLevelPhysicsSystem.get(b.level).getPipeline();
+        Pose3dc pose = child.logicalPose();
+        pipeline.resetVelocity(child);
+        pipeline.teleport(child, new Vector3d(pose.position()), new Quaterniond(pose.orientation()));
+        pipeline.resetVelocity(child);
+    }
+
+    /** R2-2: wake the parent + child islands so a rebased register is picked up
+     *  by the native servo on its next BE tick (SwivelTurretActuator's
+     *  wakeAfterWrite semantics, physics-thread-safe part only). */
+    private static void wakeIslands(ServerLevel level, SwivelBearingBlockEntity bearing) {
+        if (!(SubLevelContainer.getContainer(level) instanceof ServerSubLevelContainer sc)) return;
+        var pipeline = sc.physicsSystem().getPipeline();
+        if (Sable.HELPER.getContaining(bearing) instanceof ServerSubLevel s) pipeline.wakeUp(s);
+        if (bearing.getSubLevelID() != null
+                && sc.getSubLevel(bearing.getSubLevelID()) instanceof ServerSubLevel s2) {
+            pipeline.wakeUp(s2);
+        }
     }
 }

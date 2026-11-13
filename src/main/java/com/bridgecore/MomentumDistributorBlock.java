@@ -3,6 +3,7 @@ package com.bridgecore;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.EntityBlock;
@@ -10,12 +11,15 @@ import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.BlockEntityTicker;
 import net.minecraft.world.level.block.entity.BlockEntityType;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.storage.loot.LootParams;
+import net.minecraft.world.level.storage.loot.parameters.LootContextParams;
 import net.minecraft.world.phys.BlockHitResult;
 import org.jetbrains.annotations.Nullable;
 
-/**
- * Momentum distributor block: the structure's FE pool. Right-click opens the GUI.
- */
+import java.util.ArrayList;
+import java.util.List;
+
+/** Momentum distributor block: the structure's FE pool. Right-click opens the GUI. */
 public class MomentumDistributorBlock extends Block implements EntityBlock {
     public MomentumDistributorBlock(Properties properties) {
         super(properties);
@@ -25,6 +29,17 @@ public class MomentumDistributorBlock extends Block implements EntityBlock {
     @Override
     public BlockEntity newBlockEntity(BlockPos pos, BlockState state) {
         return new MomentumDistributorBlockEntity(pos, state);
+    }
+
+    @Override
+    protected List<ItemStack> getDrops(BlockState state, LootParams.Builder params) {
+        List<ItemStack> drops = super.getDrops(state, params);
+        if (!(params.getOptionalParameter(LootContextParams.BLOCK_ENTITY)
+                instanceof MomentumDistributorBlockEntity distributor)) return drops;
+
+        List<ItemStack> withCards = new ArrayList<>(drops);
+        distributor.addCardDrops(withCards);
+        return withCards;
     }
 
     /** The menu binds the BE

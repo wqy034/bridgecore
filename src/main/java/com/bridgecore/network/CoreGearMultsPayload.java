@@ -49,6 +49,8 @@ public record CoreGearMultsPayload(BlockPos pos, int m0, int m1, int m2, int m3)
                     return;
                 }
             }
+            if (!PayloadGuards.menuOpen(context.player(),
+                    com.bridgecore.menu.BridgeCoreMenu.class, payload.pos())) return; // P1-4
             if (context.player().level().getBlockEntity(payload.pos())
                     instanceof BridgeCoreBlockEntity be) {
                 be.setGearMults(new double[]{raw[0] / 1000.0, raw[1] / 1000.0, raw[2] / 1000.0,

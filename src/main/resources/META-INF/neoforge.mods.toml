@@ -31,6 +31,18 @@ versionRange="[2.0.3,)"
 ordering="AFTER"
 side="BOTH"
 
+# Hard dependency (2026-11-09 review P1-6): TypewriterInput references simulated
+# classes at the top level; without it the core BE fails with NoClassDefFoundError.
+# Declared mandatory so FML reports the missing dependency cleanly.
+# NOTE: keep this file ASCII-only. processResources expands it in the platform
+# charset and DisplayOptionalCcTest reads the packaged copy as UTF-8.
+[[dependencies."${mod_id}"]]
+modId="simulated"
+mandatory=true
+versionRange="[1.3.0,)"
+ordering="AFTER"
+side="BOTH"
+
 # Soft dependency: channel-table and display peripherals register only when CC is present.
 # FML 4 reads type; the legacy mandatory=false alone silently defaults to REQUIRED.
 [[dependencies."${mod_id}"]]
@@ -40,6 +52,6 @@ versionRange="[1.120.0,)"
 ordering="AFTER"
 side="BOTH"
 
-# Mixin configs (each entry gated by BridgeCoreMixinPlugin on its optional target).
+# Mixin config for Sable and optional integrations gated by BridgeCoreMixinPlugin.
 [[mixins]]
 config="bridgecore.mixins.json"

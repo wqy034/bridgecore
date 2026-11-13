@@ -92,6 +92,7 @@ public class EnergyExtractorMenu extends AbstractContainerMenu {
 
     @Override
     public void broadcastChanges() {
+        if (be == null) return; // 审查 P1-7
         // Server thread: snapshot the BE and the live CoreDirectory pool total.
         data.set(DATA_BUFFER, be.buffer());
         data.set(DATA_BUFFER_CAP, EnergyExtractorBlockEntity.BUFFER_CAPACITY);
@@ -103,7 +104,7 @@ public class EnergyExtractorMenu extends AbstractContainerMenu {
                 && Sable.HELPER.getContaining(be.getLevel(), be.getBlockPos()) instanceof ServerSubLevel sub) {
             for (MomentumDistributorBlockEntity pool : CoreDirectory.powerPoolsOf(sub)) {
                 poolTotal += pool.energy();
-                poolCap += MomentumDistributorBlockEntity.CAPACITY;
+                poolCap += pool.capacity();
             }
         }
         data.set(DATA_POOL_KFE, (int) Math.min(Integer.MAX_VALUE, poolTotal / 1000));
@@ -154,13 +155,14 @@ public class EnergyExtractorMenu extends AbstractContainerMenu {
 
     /** BE position — the screen needs it for the rate-slider payload. */
     public net.minecraft.core.BlockPos extractorPos() {
-        return be.getBlockPos();
+        return be != null ? be.getBlockPos() : net.minecraft.core.BlockPos.ZERO; // P1-7
     }
 
     @Override
     public boolean stillValid(Player player) {
         // No distance check — shipyard vs logical coordinates (see class javadoc).
-        return !be.isRemoved();
+        // 2026-11-09 审查 P1-7：BE 缺失判空。
+        return be != null && !be.isRemoved();
     }
 
     @Override

@@ -11,6 +11,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.level.ChunkPos;
 import org.jetbrains.annotations.Nullable;
 
 /**
@@ -23,14 +24,14 @@ import org.jetbrains.annotations.Nullable;
  * reassembled here per position (band 0 resets the buffer; decode happens
  * once all bands are in). Malformed packets (bad band indices, bad frame
  * size, RLE overruns) are dropped with a warn.
- *
- * Backlog: textures are never evicted (chunk-unload cleanup); test-scale leak only.
  */
 public final class HoloTextureCache {
     private static final Map<BlockPos, DynamicTexture> TEXTURES = new ConcurrentHashMap<>();
     private static final Map<BlockPos, ResourceLocation> IDS = new ConcurrentHashMap<>();
     /** Partial multi-band frames in flight, keyed like TEXTURES. */
     private static final Map<BlockPos, byte[][]> BANDS = new ConcurrentHashMap<>();
+    /** R8-2：半帧时间戳——缺段超过 5s 的缓冲帧直接丢弃，不永久占位。 */
+    private static final Map<BlockPos, Long> BAND_TIMES = new ConcurrentHashMap<>();
 
     private HoloTextureCache() {
     }
@@ -47,7 +48,8 @@ public final class HoloTextureCache {
                     pos, w, h);
             return;
         }
-        if (bandCount < 1 || bandIndex < 0 || bandIndex >= bandCount) {
+        // R8-2：bandCount 上限 16（对端可伪造 VarInt 全域，防 OOM）。
+        if (bandCount < 1 || bandCount > 16 || bandIndex < 0 || bandIndex >= bandCount) {
             BridgeCoreMod.LOGGER.warn("[bridgecore] canvas sync at {} dropped: bad band {}/{}",
                     pos, bandIndex, bandCount);
             return;
@@ -64,7 +66,17 @@ public final class HoloTextureCache {
             return; // malformed — already logged
         }
         int[] pal = palette != null ? palette : Canvas.PALETTE;
-        DynamicTexture tex = TEXTURES.computeIfAbsent(pos, p -> create(p, w, h));
+        // R8-3：同一 pos 的 canvas 尺寸变化时释放旧纹理重建（此前永不重建，
+        // 错误尺寸先到会把正确帧永久挡在外面）。
+        DynamicTexture tex = TEXTURES.get(pos);
+        if (tex != null) {
+            NativeImage old = tex.getPixels();
+            if (old != null && (old.getWidth() != w || old.getHeight() != h)) {
+                remove(pos);
+                tex = null;
+            }
+        }
+        if (tex == null) tex = TEXTURES.computeIfAbsent(pos, p -> create(p, w, h));
         NativeImage img = tex.getPixels();
         if (img == null || img.getWidth() != w || img.getHeight() != h) return;
         for (int y = 0; y < h; y++) {
@@ -87,6 +99,12 @@ public final class HoloTextureCache {
      *  nothing here relies on that. */
     private static byte @Nullable [] reassemble(BlockPos pos, int bandIndex, int bandCount,
                                                 byte[] data) {
+        long now = System.currentTimeMillis();
+        Long stamp = BAND_TIMES.get(pos);
+        if (stamp != null && now - stamp > 5000L) {
+            BANDS.remove(pos);
+        }
+        BAND_TIMES.put(pos, now);
         byte[][] slots = BANDS.compute(pos, (p, old) ->
                 old == null || old.length != bandCount || bandIndex == 0
                         ? new byte[bandCount][] : old);
@@ -99,6 +117,7 @@ public final class HoloTextureCache {
             total += slot.length;
         }
         BANDS.remove(pos);
+        BAND_TIMES.remove(pos);
         ByteArrayOutputStream out = new ByteArrayOutputStream(total);
         for (byte[] slot : slots) {
             out.write(slot, 0, slot.length);
@@ -150,6 +169,38 @@ public final class HoloTextureCache {
     /** Texture for the renderer, or null before the first sync arrives. */
     public static ResourceLocation get(BlockPos pos) {
         return IDS.get(pos);
+    }
+
+    static void expireBands() {
+        long now = System.currentTimeMillis();
+        BAND_TIMES.entrySet().removeIf(entry -> {
+            if (now - entry.getValue() <= 5000L) return false;
+            BANDS.remove(entry.getKey());
+            return true;
+        });
+    }
+
+    static void unloadChunk(ChunkPos chunk) {
+        IDS.keySet().forEach(pos -> { if (inChunk(pos, chunk)) remove(pos); });
+        BAND_TIMES.keySet().forEach(pos -> {
+            if (inChunk(pos, chunk)) { BANDS.remove(pos); BAND_TIMES.remove(pos); }
+        });
+    }
+
+    static void clear() {
+        IDS.keySet().forEach(HoloTextureCache::remove);
+        BANDS.clear();
+        BAND_TIMES.clear();
+    }
+
+    static boolean inChunk(BlockPos pos, ChunkPos chunk) {
+        return pos.getX() >> 4 == chunk.x && pos.getZ() >> 4 == chunk.z;
+    }
+
+    private static void remove(BlockPos pos) {
+        TEXTURES.remove(pos);
+        ResourceLocation id = IDS.remove(pos);
+        if (id != null) Minecraft.getInstance().getTextureManager().release(id);
     }
 
     /** Canvas palette is ARGB; NativeImage wants ABGR. */

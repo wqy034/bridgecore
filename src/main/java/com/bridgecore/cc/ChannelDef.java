@@ -15,8 +15,9 @@ import java.util.function.Supplier;
  * Writer protocol: receives the raw Lua argument as delivered by CC (String /
  * Double / Boolean / Map) and returns the Lua result (null = no return value);
  * throw IllegalArgumentException on invalid input — the peripheral translates it
- * into a Lua error. Readers and writers run on the SERVER thread (CC invokes
- * peripheral methods on the main thread) and must never block.
+ * into a Lua error. CC invokes peripheral methods on ITS OWN thread; the
+ * peripheral marshals everything onto the SERVER thread via
+ * ILuaContext.executeMainThreadTask (R4-1), so readers/writers must never block.
  */
 public record ChannelDef(String name, boolean readable, boolean writable,
                          Supplier<Object> reader, Function<Object, Object> writer, String doc) {

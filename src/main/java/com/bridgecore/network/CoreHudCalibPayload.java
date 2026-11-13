@@ -86,6 +86,8 @@ public record CoreHudCalibPayload(BlockPos pos, int x100, int y100, int scale100
                         context.player().getName().getString());
                 return;
             }
+            if (!PayloadGuards.menuOpen(context.player(),
+                    com.bridgecore.menu.BridgeCoreMenu.class, payload.pos())) return; // P1-4
             if (context.player().level().getBlockEntity(payload.pos())
                     instanceof BridgeCoreBlockEntity be) {
                 be.setHudCalib(payload.x100() / 100.0, payload.y100() / 100.0,

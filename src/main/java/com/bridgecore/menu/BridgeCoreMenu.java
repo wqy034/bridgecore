@@ -148,6 +148,7 @@ public class BridgeCoreMenu extends AbstractContainerMenu {
 
     @Override
     public void broadcastChanges() {
+        if (be == null) return; // 审查 P1-7：客户端 BE 缺失时不刷数据
         double[] gm = be.gearMults();
         for (int i = 0; i < BridgeCoreBlockEntity.GEAR_COUNT; i++) {
             data.set(DATA_GEAR_MULT_0 + i, (int) Math.round(gm[i] * 1000.0));
@@ -191,7 +192,7 @@ public class BridgeCoreMenu extends AbstractContainerMenu {
         if (sub != null) {
             for (MomentumDistributorBlockEntity pool : CoreDirectory.powerPoolsOf(sub)) {
                 poolTotal += pool.energy();
-                poolCap += MomentumDistributorBlockEntity.CAPACITY;
+                poolCap += pool.capacity();
             }
             if (sub.getMassTracker() != null) {
                 mass = (long) sub.getMassTracker().getMass();
@@ -366,13 +367,14 @@ public class BridgeCoreMenu extends AbstractContainerMenu {
 
     /** BE position — the screen needs it for the three config payloads. */
     public net.minecraft.core.BlockPos corePos() {
-        return be.getBlockPos();
+        // 2026-11-09 审查 P1-7：客户端 BE 可能尚未到位（船载/未加载），判空降级。
+        return be != null ? be.getBlockPos() : net.minecraft.core.BlockPos.ZERO;
     }
 
     @Override
     public boolean stillValid(Player player) {
         // No distance check — shipyard vs logical coordinates (see class javadoc).
-        return !be.isRemoved();
+        return be != null && !be.isRemoved();
     }
 
     @Override

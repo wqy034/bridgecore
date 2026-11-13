@@ -14,5 +14,7 @@ public enum PointingMode {
     /** Track an entity (payload: entity UUID). */
     TRACK_ENTITY,
     /** Hold a pure direction (payload: Vec3 unit vector, world frame). */
-    POINT_AT_DIR
+    POINT_AT_DIR,
+    /** Hold a full body-to-world attitude, including roll. */
+    HOLD_ATTITUDE
 }

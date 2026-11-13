@@ -3,6 +3,8 @@
   "package": "com.bridgecore.mixin",
   "plugin": "com.bridgecore.mixin.BridgeCoreMixinPlugin",
   "mixins": [
+    "HoldingSubLevelLocationMixin",
+    "SubLevelHoldingChunkLocationMixin",
     "TweakedLecternRangeMixin",
     "SwivelBearingAccessorMixin",
     "SwivelBearingAxisLockMixin"

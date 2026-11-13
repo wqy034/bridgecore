@@ -127,6 +127,8 @@ dependencies {
     })
     testImplementation platform('org.junit:junit-bom:5.10.2')
     testImplementation 'org.junit.jupiter:junit-jupiter'
+    // Use the same JOML version as Minecraft 1.21.1 for standalone controller tests.
+    testImplementation 'org.joml:joml:1.10.5'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 

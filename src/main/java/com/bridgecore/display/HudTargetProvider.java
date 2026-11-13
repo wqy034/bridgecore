@@ -91,9 +91,11 @@ public interface HudTargetProvider {
     /** One server-thread view of the command channel. Energy is the minimum
      * valid mount fraction, NOT a pooled FE total. null means unknown;
      * partialEnergy marks mounts with no usable reading. */
+    record MacroStatusView(int ready, int total, String reason) {}
+
     record WeaponStatusView(ChannelTaskView task, boolean autoFire,
                             boolean salvoWaiting, List<TurretStatusView> turrets,
-                            @Nullable Double minimumEnergyRatio, boolean partialEnergy) {}
+                            @Nullable Double minimumEnergyRatio, boolean partialEnergy, @Nullable MacroStatusView macro) {}
 
     /** HUD presentation only: no scanning, assignments, gate evaluation or
      * commands may be performed by this query. Null clears the weapon block. */

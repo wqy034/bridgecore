@@ -117,7 +117,11 @@ public final class CCDisplayPeripheral implements IDynamicPeripheral, ExternalDi
             epoch = disconnectEpochs.merge(id, 1L, Long::sum);
         }
         server.accept(() -> {
-            if (!closed && owner != null && owner == id && ownerEpoch < epoch) revoke("detached");
+            // R4-2：排队期间同 id 重连并 claim 的电脑不能被旧 detach 反杀——
+            // 加 !hasComputer(id) 复查。
+            if (!closed && !hasComputer(id) && owner != null && owner == id && ownerEpoch < epoch) {
+                revoke("detached");
+            }
         });
     }
     private long epoch(int id) { synchronized (computers) { return disconnectEpochs.getOrDefault(id, 0L); } }
@@ -139,7 +143,7 @@ public final class CCDisplayPeripheral implements IDynamicPeripheral, ExternalDi
 
     /** Package-visible for contract tests; production entry is always executeMainThreadTask. */
     Object[] invoke(IComputerAccess computer, String name, IArguments a) throws LuaException {
-        if (closed || !available.getAsBoolean() || !attached(computer)) throw new LuaException("Display detached");
+        if (closed || !attached(computer) || !available.getAsBoolean()) throw new LuaException("Display detached");
         checkDisconnected();
         name = OPERATIONS.getOrDefault(name, name).replace("Colour", "Color");
         try {
@@ -242,6 +246,9 @@ public final class CCDisplayPeripheral implements IDynamicPeripheral, ExternalDi
         if (sink.width() == 0 || sink.height() == 0) throw new LuaException("No screen connected");
         if (explicit) revoked.remove(id);
         if (owner == null) { owner = id; ownerEpoch = epoch(id); resetTerminal(); sink.clear(); dirty = true; }
+        // R10-1（R4-2 闭合）：同 id 重连并 claim 时 owner 仍是自己，也要刷新
+        // ownerEpoch，否则下一 tick checkDisconnected 仍会 revoke。
+        else if (owner == id) ownerEpoch = epoch(id);
     }
     private void switchMode(String next) throws LuaException {
         if (!next.equals("cell") && !next.equals("pixel")) throw new LuaException("layer must be cell or pixel");
@@ -284,8 +291,10 @@ public final class CCDisplayPeripheral implements IDynamicPeripheral, ExternalDi
     }
     private void event(String name, boolean onlyOwner, Object... args) {
         synchronized (computers) {
+            Set<Integer> delivered = new HashSet<>(); // R4-4：同一台电脑多路挂载只投一次
             for (Iterator<IComputerAccess> it = computers.iterator(); it.hasNext();) {
                 IComputerAccess c = it.next();
+                if (!delivered.add(c.getID())) continue;
                 try {
                     if (onlyOwner && (owner == null || c.getID() != owner)) continue;
                     Object[] values = new Object[args.length + 1]; values[0] = c.getAttachmentName();

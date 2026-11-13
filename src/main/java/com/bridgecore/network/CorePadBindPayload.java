@@ -61,6 +61,8 @@ public record CorePadBindPayload(BlockPos pos, int kind, int channel, int value1
                         context.player().getName().getString());
                 return;
             }
+            if (!PayloadGuards.menuOpen(context.player(),
+                    com.bridgecore.menu.BridgeCoreMenu.class, payload.pos())) return; // P1-4
             if (context.player().level().getBlockEntity(payload.pos())
                     instanceof BridgeCoreBlockEntity be) {
                 if (payload.kind() == KIND_AXIS) {

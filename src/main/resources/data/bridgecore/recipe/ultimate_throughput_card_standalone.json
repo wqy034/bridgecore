@@ -1,0 +1,17 @@
+{
+  "neoforge:conditions": [
+    {
+      "type": "neoforge:not",
+      "value": { "type": "neoforge:mod_loaded", "modid": "mekanism" }
+    }
+  ],
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "pattern": ["NCN", "CSC", "NCN"],
+  "key": {
+    "N": { "item": "minecraft:netherite_ingot" },
+    "C": { "item": "bridgecore:elite_throughput_card" },
+    "S": { "item": "minecraft:nether_star" }
+  },
+  "result": { "id": "bridgecore:ultimate_throughput_card" }
+}

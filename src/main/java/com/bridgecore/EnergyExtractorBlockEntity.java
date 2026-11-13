@@ -333,7 +333,7 @@ public class EnergyExtractorBlockEntity extends BlockEntity implements MenuProvi
             // Resume threshold: 5% of total sink capacity, or 20 ticks of output,
             // whichever is larger (the smoother of the two for this rate).
             long totalCap = pools.isEmpty() ? BUFFER_CAPACITY
-                    : (long) pools.size() * MomentumDistributorBlockEntity.CAPACITY;
+                    : pools.stream().mapToLong(MomentumDistributorBlockEntity::capacity).sum();
             long resumeAt = Math.max((long) (totalCap * HYSTERESIS_CAPACITY_FRACTION),
                     (long) need * HYSTERESIS_TICKS_OF_OUTPUT);
             if (space < resumeAt) {
@@ -426,8 +426,13 @@ public class EnergyExtractorBlockEntity extends BlockEntity implements MenuProvi
         fuelSlot.deserializeNBT(registries, tag.getCompound("fuel"));
         heat = Math.max(0, Math.min(HEAT_CAPACITY, tag.getInt("heat")));
         ratePercent = Math.max(0, Math.min(100, tag.getInt("rate")));
-        lastTax = tag.contains("lastTax") ? tag.getDouble("lastTax") : FALLBACK_TAX;
-        accumulator = tag.getDouble("acc");
+        // R6-2：acc/lastTax 脏值（NaN/Inf/越界）回退——否则 FE 永久不产出 +
+        // END 恒 ∞。acc 合法域 = [0,1)。
+        lastTax = tag.contains("lastTax")
+                ? com.bridgecore.NbtGuards.finiteOr(tag.getDouble("lastTax"), FALLBACK_TAX)
+                : FALLBACK_TAX;
+        double acc = com.bridgecore.NbtGuards.finiteOr(tag.getDouble("acc"), 0.0);
+        accumulator = acc >= 0.0 && acc < 1.0 ? acc : 0.0;
         buffer = Math.max(0, Math.min(BUFFER_CAPACITY, tag.getInt("fe")));
     }
 }

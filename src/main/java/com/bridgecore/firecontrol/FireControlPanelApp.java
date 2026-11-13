@@ -152,8 +152,8 @@ public final class FireControlPanelApp implements DisplayApp {
     private int orientY0 = -1, orientY1;
 
     /** Channel page (settings tab) click map of the last render. */
-    private final int[] chTabX0 = new int[FireControlCoreBlockEntity.CHANNEL_COUNT];
-    private final int[] chTabX1 = new int[FireControlCoreBlockEntity.CHANNEL_COUNT];
+    private final int[] chTabX0 = new int[2];
+    private final int[] chTabX1 = new int[2];
     private int chTabY0 = -1, chTabY1;
     private int chAutoX0, chAutoX1, chAutoY0 = -1, chAutoY1;
     /** 自动升格 toggle (火力指挥层④), same row as 自动开火. */
@@ -171,7 +171,8 @@ public final class FireControlPanelApp implements DisplayApp {
     private int renderedChannel, lastCanvasWidth;
     private final List<java.util.UUID> statusTurretIds = new ArrayList<>();
     private final List<java.util.UUID> memberTurretIds = new ArrayList<>();
-    private final List<Integer> memberChannels = new ArrayList<>();
+    private final List<Boolean> memberIncluded = new ArrayList<>();
+    private final List<Boolean> memberMacro = new ArrayList<>();
     private final List<int[]> stMinusX = new ArrayList<>();
     private final List<int[]> stPlusX = new ArrayList<>();
     private static final String[] ORIENT_LABELS = {"北", "东", "南", "西"};
@@ -209,7 +210,8 @@ public final class FireControlPanelApp implements DisplayApp {
         statusPagerY0 = -1;
         statusTurretIds.clear();
         memberTurretIds.clear();
-        memberChannels.clear();
+        memberIncluded.clear();
+        memberMacro.clear();
         stMinusX.clear();
         stPlusX.clear();
         int w = canvas.width();
@@ -255,7 +257,10 @@ public final class FireControlPanelApp implements DisplayApp {
     private void renderTopBar(Canvas canvas, int w) {
         canvas.fillRect(0, 0, w, TOPBAR, C_PANEL);
         canvas.drawCjkText(MARGIN, px(3), "火控控制屏", C_TEXT, titleFont);
-        String context = fit(core.channelName(core.activeChannel()), 5) + " · " + (int) core.scanRadius() + "M";
+        String range = " · " + (int) core.scanRadius() + "M";
+        int nameWidth = w - 2 * MARGIN - px(8) - canvas.cjkTextWidth("火控控制屏", titleFont)
+                - canvas.cjkTextWidth(range, bodyFont);
+        String context = fitPixels(canvas, core.channelName(core.activeChannel()), nameWidth) + range;
         canvas.drawCjkText(w - MARGIN - canvas.cjkTextWidth(context, bodyFont), px(9), context, C_DIM, bodyFont);
         int gap = px(3), tabW = Math.min(px(112), (w - MARGIN * 2 - gap * 3) / 4);
         tabY0 = px(32); tabY1 = tabY0 + px(18);
@@ -306,19 +311,41 @@ public final class FireControlPanelApp implements DisplayApp {
         canvas.hLine(MARGIN, w - MARGIN - 1, y - 3, C_HAIR);
 
         List<TurretUnit> units = List.copyOf(core.turrets());
+        List<FixedGun> macros = List.copyOf(core.fixedGuns());
+        int weaponCount = units.size() + macros.size();
         int capacity = Math.max(1, (h - px(26) - y) / STATUS_ROW);
-        statusPages = Math.max(1, (units.size() + capacity - 1) / capacity);
+        statusPages = Math.max(1, (weaponCount + capacity - 1) / capacity);
         statusPage = Math.min(statusPage, statusPages - 1);
         int start = statusPage * capacity;
         stRowY0 = y;
-        for (int row = start; row < Math.min(units.size(), start + capacity); row++) {
+        for (int row = start; row < Math.min(weaponCount, start + capacity); row++) {
+            if (row >= units.size()) {
+                FixedGun macro = macros.get(row - units.size());
+                MacroReadout sample = core.macroReadout(macro);
+                statusTurretIds.add(macro.id());
+                stMinusX.add(new int[]{-1, -1});
+                stPlusX.add(new int[]{-1, -1});
+                if (macro.belongsTo(core.activeChannel())) canvas.fillRect(MARGIN, y - 1, w - MARGIN * 2, STATUS_ROW - 2, C_PANEL);
+                String header = macro.name() + " / 宏炮";
+                if (sample != null && sample.aim().distance() >= 0 && sample.aim().range() > 0)
+                    header += " · " + (int) sample.aim().distance() + "/" + (int) sample.aim().range() + "m";
+                canvas.drawCjkText(MARGIN + 2, y, fitPixels(canvas, header, w - 2 * MARGIN - 4), C_TEXT, bodyFont);
+                String detail = macroLabel(sample);
+                if (sample != null && sample.capacity() > 0) detail += " · FE "
+                        + Math.round(100.0 * sample.energy() / sample.capacity()) + "%";
+                canvas.drawCjkText(MARGIN + 2, y + px(16), fitPixels(canvas, detail, w - 2 * MARGIN - 4),
+                        sample != null && sample.aim().ready() ? C_FRIEND : C_WARN, bodyFont);
+                y += STATUS_ROW;
+                canvas.hLine(MARGIN, w - MARGIN - 1, y - 3, C_GRID);
+                continue;
+            }
             TurretUnit unit = units.get(row);
             statusTurretIds.add(unit.id());
             boolean ready = unit.isReady();
-            FireDirector.GateResult gate = core.gateOf(unit.id());
+            FireDirector.GateResult gate = core.currentHudGate(unit.id());
             String state = !unit.actuator().isPaired() ? "未配对" : !ready ? "校准中" : gate == null ? "就绪" : gateLabel(gate.gate());
             int color = !ready ? C_WARN : gate == null ? C_FRIEND : gateColor(gate.gate());
-            if (unit.channel() == core.activeChannel()) canvas.fillRect(MARGIN, y - 1, w - MARGIN * 2, STATUS_ROW - 2, C_PANEL);
+            if (unit.belongsTo(core.activeChannel())) canvas.fillRect(MARGIN, y - 1, w - MARGIN * 2, STATUS_ROW - 2, C_PANEL);
             int nameWidth = Math.max(px(78), (w - MARGIN * 2) / 3);
             canvas.drawCjkText(MARGIN + 2, y, fitPixels(canvas, unit.name(), nameWidth - 4), C_TEXT, bodyFont);
             String gun = core.turretGunLabel(row);
@@ -343,9 +370,9 @@ public final class FireControlPanelApp implements DisplayApp {
             y += STATUS_ROW;
             canvas.hLine(MARGIN, w - MARGIN - 1, y - 3, C_GRID);
         }
-        if (units.isEmpty()) canvas.drawCjkText(MARGIN, y, "尚未配对炮塔", C_DIM, bodyFont);
+        if (weaponCount == 0) canvas.drawCjkText(MARGIN, y, "尚未登记武器", C_DIM, bodyFont);
         statusPagerY0 = h - px(19);
-        canvas.drawCjkText(MARGIN, h - px(17), (statusPage + 1) + "/" + statusPages + " · " + units.size() + " 座炮塔", C_DIM, bodyFont);
+        canvas.drawCjkText(MARGIN, h - px(17), (statusPage + 1) + "/" + statusPages + " · " + weaponCount + " 武器", C_DIM, bodyFont);
         if (statusPages > 1) drawSegment(canvas, w - MARGIN - px(64), statusPagerY0, px(64), px(16), "下一页", false);
     }
 
@@ -372,16 +399,20 @@ public final class FireControlPanelApp implements DisplayApp {
      *  gate chain (mounts, cadence, LOF included). 允许 n/m = n turrets can
      *  fire right now; 待机 = nothing firing only because auto switches are
      *  off; otherwise the first real blocking gate names the problem. */
+    private static String macroLabel(@Nullable MacroReadout sample) {
+        return sample == null ? "状态待更新" : sample.label();
+    }
+
     private void drawGateChip(Canvas canvas, int rightX, int y) {
         int fire = 0, total = 0;
         FireDirector.Gate firstBlock = null;
         int ch = core.activeChannel();
         for (TurretUnit u : core.turrets()) {
-            if (u.channel() != ch || !u.actuator().isPaired() || u.actuator().mountCount() <= 0) {
+            if (!u.belongsTo(ch) || !u.actuator().isPaired() || u.actuator().mountCount() <= 0) {
                 continue;
             }
             total++;
-            FireDirector.GateResult g = core.gateOf(u.id());
+            FireDirector.GateResult g = core.currentHudGate(u.id());
             if (g == null) {
                 continue;
             }
@@ -392,6 +423,15 @@ public final class FireControlPanelApp implements DisplayApp {
                 firstBlock = g.gate();
             }
         }
+        String macroBlock = null;
+        for (FixedGun gun : core.fixedGuns()) {
+            if (!gun.belongsTo(ch)) continue;
+            total++;
+            var sample = core.macroReadout(gun);
+            if (sample != null && sample.aim().ready()) {
+                if (core.channelAutoFire(ch) && !core.channelSalvoWaiting(ch)) fire++;
+            } else if (macroBlock == null) macroBlock = macroLabel(sample);
+        }
         String text;
         int color;
         if (total == 0) {
@@ -400,6 +440,9 @@ public final class FireControlPanelApp implements DisplayApp {
         } else if (fire > 0) {
             text = "开火门 允许 " + fire + "/" + total;
             color = C_FRIEND;
+        } else if (firstBlock == null && macroBlock != null) {
+            text = "宏炮 " + macroBlock;
+            color = C_WARN;
         } else if (firstBlock == null) {
             text = "开火门 待机"; // blocked by nothing but the auto switches
             color = C_DIM;
@@ -449,13 +492,16 @@ public final class FireControlPanelApp implements DisplayApp {
     private void renderSettingsPage(Canvas canvas, int w, int h) {
         int y = TOPBAR + px(6);
         chTabY0 = y; chTabY1 = y + px(18);
-        int tabW = (w - MARGIN * 2 - px(12)) / 4;
-        for (int ch = 0; ch < 4; ch++) {
-            chTabX0[ch] = MARGIN + ch * (tabW + 4); chTabX1[ch] = chTabX0[ch] + tabW;
-            drawSegment(canvas, chTabX0[ch], y, tabW, px(18), fitPixels(canvas, core.channelName(ch), tabW - px(10)), core.activeChannel() == ch);
-        }
-        y += px(24);
         int ch = core.activeChannel();
+        int tabW = px(32);
+        chTabX0[0] = MARGIN; chTabX1[0] = MARGIN + tabW;
+        chTabX0[1] = w - MARGIN - tabW; chTabX1[1] = w - MARGIN;
+        drawSegment(canvas, chTabX0[0], y, tabW, px(18), "<", false);
+        drawSegment(canvas, chTabX0[1], y, tabW, px(18), ">", false);
+        canvas.drawCjkText(chTabX1[0] + px(5), y + px(3),
+                fitPixels(canvas, (ch + 1) + "/" + core.channelCount() + " · " + core.channelName(ch),
+                        chTabX0[1] - chTabX1[0] - px(10)), C_PRI, bodyFont);
+        y += px(24);
         boolean promote = core.channelAutoPromote(ch), suppressed = core.taskOf(ch).promoteSuppressed();
         chAutoY0 = y; chAutoY1 = y + px(18);
         int half = (w - MARGIN * 2 - px(6)) / 2;
@@ -467,35 +513,42 @@ public final class FireControlPanelApp implements DisplayApp {
         y += px(23);
         ChannelTask task = core.taskOf(ch);
         String taskText = FireControlUiText.source(task.source().ordinal()) + " · " + FireControlUiText.mode(task.mode().ordinal())
-                + " · 成员 " + core.pairedCountOf(ch);
+                + " · 成员 " + (core.pairedCountOf(ch) + core.fixedGuns().stream().filter(gun -> gun.belongsTo(ch)).count());
         canvas.drawCjkText(MARGIN, y, fitPixels(canvas, taskText, w - 2 * MARGIN), C_TEXT, bodyFont);
         y += ROW;
         canvas.hLine(MARGIN, w - MARGIN - 1, y - 3, C_HAIR);
         memberY0 = y; memberX1 = w - MARGIN;
         List<TurretUnit> units = List.copyOf(core.turrets());
+        List<FixedGun> macros = List.copyOf(core.fixedGuns());
+        int weapons = units.size() + macros.size();
         int perPage = Math.max(1, (h - px(25) - y) / MEMBER_ROW);
-        memberPages = Math.max(1, (units.size() + perPage - 1) / perPage);
+        memberPages = Math.max(1, (weapons + perPage - 1) / perPage);
         memberPage = Math.min(memberPage, memberPages - 1);
         memberRowBase = memberPage * perPage;
         memberRows = 0;
-        for (int row = memberRowBase; row < Math.min(units.size(), memberRowBase + perPage); row++) {
-            TurretUnit unit = units.get(row);
-            memberTurretIds.add(unit.id());
-            memberChannels.add(unit.channel());
-            boolean inActive = unit.channel() == ch;
+        for (int row = memberRowBase; row < Math.min(weapons, memberRowBase + perPage); row++) {
+            boolean isMacro = row >= units.size();
+            FixedGun macro = isMacro ? macros.get(row - units.size()) : null;
+            TurretUnit unit = isMacro ? null : units.get(row);
+            boolean inActive = isMacro ? macro.belongsTo(ch) : unit.belongsTo(ch);
+            String name = isMacro ? macro.name() : unit.name();
+            String detail = isMacro ? "宏炮 · " + macroLabel(core.macroReadout(macro)) : core.turretGunLabel(row);
+            memberTurretIds.add(isMacro ? macro.id() : unit.id());
+            memberIncluded.add(inActive);
+            memberMacro.add(isMacro);
             if (inActive) canvas.fillRect(MARGIN, y - 2, w - MARGIN * 2, MEMBER_ROW - 1, C_PANEL);
-            canvas.drawCjkText(MARGIN + 2, y, fitPixels(canvas, unit.name(), w - MARGIN * 2 - px(86)), inActive ? C_PRI : C_TEXT, bodyFont);
-            String gun = core.turretGunLabel(row);
-            canvas.drawCjkText(MARGIN + 2, y + px(14), fitPixels(canvas, gun == null ? "未装配武器" : gun, w - 2 * MARGIN - px(86)), C_DIM, bodyFont);
-            String action = inActive ? "移出本频道" : unit.channel() < 0 ? "加入本频道" : "转入本频道";
+            canvas.drawCjkText(MARGIN + 2, y, fitPixels(canvas, name, w - MARGIN * 2 - px(86)), inActive ? C_PRI : C_TEXT, bodyFont);
+            canvas.drawCjkText(MARGIN + 2, y + px(14), fitPixels(canvas, detail == null ? "未装配武器" : detail, w - 2 * MARGIN - px(86)), C_DIM, bodyFont);
+            String action = inActive ? "移出本组" : "加入本组";
             int actionW = canvas.cjkTextWidth(action, bodyFont) + px(10);
             drawSegment(canvas, w - MARGIN - actionW, y + 3, actionW, px(19), action, inActive);
-            y += MEMBER_ROW; memberRows++;
+            y += MEMBER_ROW;
+            memberRows++;
             canvas.hLine(MARGIN, w - MARGIN - 1, y - 3, C_GRID);
         }
-        if (units.isEmpty()) canvas.drawCjkText(MARGIN, y, "先配对炮塔，再编入频道", C_DIM, bodyFont);
+        if (weapons == 0) canvas.drawCjkText(MARGIN, y, "尚未登记武器", C_DIM, bodyFont);
         pagerY0 = h - px(19); pagerY1 = h - 3;
-        canvas.drawCjkText(MARGIN, h - px(17), (memberPage + 1) + "/" + memberPages + " · 单塔独占频道", C_DIM, bodyFont);
+        canvas.drawCjkText(MARGIN, h - px(17), (memberPage + 1) + "/" + memberPages + " · 可加入多组", C_DIM, bodyFont);
         pagerX1 = w - MARGIN; pagerX0 = pagerX1 - px(64);
         if (memberPages > 1) drawSegment(canvas, pagerX0, pagerY0, px(64), px(16), "下一页", false);
     }
@@ -635,7 +688,10 @@ public final class FireControlPanelApp implements DisplayApp {
         canvas.vLine(listX0 - 4, bodyTop, bodyBottom, C_HAIR);
         canvas.drawCjkText(listX0, bodyTop, "目标", C_DIM, bodyFont);
         // 已选 m/N (裁断稿 §3: 点选容量 = 频道已配对炮塔数)
-        String selInfo = "选" + selection.size() + "/" + core.pairedCountOf(core.activeChannel());
+        int group = core.activeChannel();
+        int paired = core.pairedCountOf(group);
+        boolean macroOnly = paired == 0 && core.fixedGuns().stream().anyMatch(gun -> gun.belongsTo(group));
+        String selInfo = macroOnly ? precise == null ? "未锁" : "精锁" : "选" + selection.size() + "/" + paired;
         String countInfo = "N=" + targets.size();
         canvas.drawCjkText(listX1 - canvas.cjkTextWidth(countInfo, bodyFont), bodyTop, countInfo, C_DIM, bodyFont);
         canvas.drawCjkText(listX1 - canvas.cjkTextWidth(countInfo, bodyFont)
@@ -965,9 +1021,10 @@ public final class FireControlPanelApp implements DisplayApp {
         }
         if (pageIdx == PAGE_SETTINGS) {
             if (chTabY0 >= 0 && y >= chTabY0 && y <= chTabY1) {
-                for (int c = 0; c < FireControlCoreBlockEntity.CHANNEL_COUNT; c++) {
-                    if (x >= chTabX0[c] && x < chTabX1[c]) {
-                        core.setActiveChannel(c);
+                if (core.activeChannel() != renderedChannel) return;
+                for (int i = 0; i < 2; i++) {
+                    if (x >= chTabX0[i] && x < chTabX1[i]) {
+                        core.setActiveChannel(Math.floorMod(renderedChannel + (i == 0 ? -1 : 1), core.channelCount()));
                         return;
                     }
                 }
@@ -990,11 +1047,23 @@ public final class FireControlPanelApp implements DisplayApp {
             if (memberY0 >= 0 && y >= memberY0 - 2 && x >= MARGIN && x < memberX1) {
                 int visible = (y - memberY0 + 2) / MEMBER_ROW;
                 if (visible >= 0 && visible < memberTurretIds.size()) {
-                    int row = turretIndex(memberTurretIds.get(visible));
-                    if (row >= 0) {
-                        TurretUnit unit = core.turretByIndex(row);
-                        if (unit.channel() == memberChannels.get(visible))
-                            core.setTurretChannel(row, memberChannels.get(visible) == renderedChannel ? -1 : renderedChannel);
+                    if (core.activeChannel() != renderedChannel) return;
+                    var id = memberTurretIds.get(visible);
+                    boolean included = memberIncluded.get(visible);
+                    if (memberMacro.get(visible)) {
+                        int row = 0;
+                        for (FixedGun gun : core.fixedGuns()) {
+                            if (gun.id().equals(id)) {
+                                if (gun.belongsTo(renderedChannel) == included)
+                                    core.editFixedGunGroup(row, renderedChannel, !included);
+                                break;
+                            }
+                            row++;
+                        }
+                    } else {
+                        int row = turretIndex(id);
+                        if (row >= 0 && core.turretByIndex(row).belongsTo(renderedChannel) == included)
+                            core.editTurretGroup(row, renderedChannel, !included);
                     }
                     return;
                 }
@@ -1029,7 +1098,7 @@ public final class FireControlPanelApp implements DisplayApp {
             }
             return;
         }
-        if (pageIdx != PAGE_RADAR) return;
+        if (pageIdx != PAGE_RADAR || core.activeChannel() != renderedChannel) return;
         // bottom toolbar
         if (toolbarY0 >= 0 && y >= toolbarY0 && y <= toolbarY1) {
             for (int i = 0; i < FILTER_LABELS.length; i++) {

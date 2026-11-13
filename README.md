@@ -2,7 +2,7 @@
 
 把 Create: Aeronautics 的物理结构变成一艘可驾驶的船：星舰飞控、火控、FE 能量体系、全息姿态仪 HUD，以及手柄、键盘、红石和 CC:Tweaked 输入。
 
-当前版本：0.1.2，Minecraft 1.21.1 / NeoForge。
+当前版本：0.1.3，Minecraft 1.21.1 / NeoForge。
 
 ## 功能概览
 

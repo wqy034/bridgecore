@@ -7,6 +7,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.level.ChunkPos;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -19,8 +20,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * Slices arrive as ABGR ints, which is exactly NativeImage's channel order, so
  * the upload is a straight per-pixel copy.
  *
- * Eviction: server-sent clears and client BE removal drop entries (see
- * remove()); chunk-unload eviction without a clear is still backlog.
+ * Eviction follows server clears, tile removal and client chunk or level unload.
  */
 public final class DisplayTileTextureCache {
     private static final Map<BlockPos, Entry> TEXTURES = new ConcurrentHashMap<>();
@@ -53,7 +53,6 @@ public final class DisplayTileTextureCache {
     private static Entry create(BlockPos pos, int w, Entry old) {
         if (old != null) {
             Minecraft.getInstance().getTextureManager().release(old.id);
-            old.tex.close();
         }
         DynamicTexture tex = new DynamicTexture(w, w, false);
         // no TextureFiltering.enableMipmapChain here — tiles are NEAREST-only
@@ -77,8 +76,15 @@ public final class DisplayTileTextureCache {
         Entry entry = TEXTURES.remove(pos);
         if (entry != null) {
             Minecraft.getInstance().getTextureManager().release(entry.id);
-            entry.tex.close();
         }
+    }
+
+    static void unloadChunk(ChunkPos chunk) {
+        TEXTURES.keySet().forEach(pos -> { if (HoloTextureCache.inChunk(pos, chunk)) remove(pos); });
+    }
+
+    static void clear() {
+        TEXTURES.keySet().forEach(DisplayTileTextureCache::remove);
     }
 
     private record Entry(DynamicTexture tex, ResourceLocation id, int width) {

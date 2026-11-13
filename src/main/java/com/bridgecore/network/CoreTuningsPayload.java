@@ -49,6 +49,8 @@ public record CoreTuningsPayload(BlockPos pos, int kd, int kp, int transKv,
 
     public static void handle(CoreTuningsPayload payload, IPayloadContext context) {
         context.enqueueWork(() -> {
+            if (!PayloadGuards.menuOpen(context.player(),
+                    com.bridgecore.menu.BridgeCoreMenu.class, payload.pos())) return; // P1-4
             if (context.player().level().getBlockEntity(payload.pos())
                     instanceof BridgeCoreBlockEntity be) {
                 // Per-field clamp (not reject): sliders quantize client-side, but a

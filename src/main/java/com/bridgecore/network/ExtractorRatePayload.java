@@ -40,6 +40,8 @@ public record ExtractorRatePayload(BlockPos pos, int percent) implements CustomP
                         payload.percent(), context.player().getName().getString());
                 return;
             }
+            if (!PayloadGuards.menuOpen(context.player(),
+                    com.bridgecore.menu.EnergyExtractorMenu.class, payload.pos())) return; // P1-4
             if (context.player().level().getBlockEntity(payload.pos())
                     instanceof EnergyExtractorBlockEntity be) {
                 be.setRatePercent(payload.percent());

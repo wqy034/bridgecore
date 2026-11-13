@@ -84,6 +84,23 @@ public final class BCRegistry {
     public static final DeferredItem<BlockItem> MOMENTUM_DISTRIBUTOR_ITEM = ITEMS.register("momentum_distributor",
             () -> new BlockItem(MOMENTUM_DISTRIBUTOR.get(), new Item.Properties()));
 
+    public static final DeferredItem<DistributorUpgradeItem> BASIC_CAPACITY_CARD = ITEMS.register("basic_capacity_card",
+            () -> new DistributorUpgradeItem(100_000, 0, 0));
+    public static final DeferredItem<DistributorUpgradeItem> ADVANCED_CAPACITY_CARD = ITEMS.register("advanced_capacity_card",
+            () -> new DistributorUpgradeItem(500_000, 0, 0));
+    public static final DeferredItem<DistributorUpgradeItem> ELITE_CAPACITY_CARD = ITEMS.register("elite_capacity_card",
+            () -> new DistributorUpgradeItem(1_200_000, 0, 0));
+    public static final DeferredItem<DistributorUpgradeItem> ULTIMATE_CAPACITY_CARD = ITEMS.register("ultimate_capacity_card",
+            () -> new DistributorUpgradeItem(4_800_000, 0, 0));
+    public static final DeferredItem<DistributorUpgradeItem> BASIC_THROUGHPUT_CARD = ITEMS.register("basic_throughput_card",
+            () -> new DistributorUpgradeItem(0, 1_500, 5_000));
+    public static final DeferredItem<DistributorUpgradeItem> ADVANCED_THROUGHPUT_CARD = ITEMS.register("advanced_throughput_card",
+            () -> new DistributorUpgradeItem(0, 6_500, 18_000));
+    public static final DeferredItem<DistributorUpgradeItem> ELITE_THROUGHPUT_CARD = ITEMS.register("elite_throughput_card",
+            () -> new DistributorUpgradeItem(0, 9_000, 28_000));
+    public static final DeferredItem<DistributorUpgradeItem> ULTIMATE_THROUGHPUT_CARD = ITEMS.register("ultimate_throughput_card",
+            () -> new DistributorUpgradeItem(0, 160_000, 360_000));
+
     public static final DeferredHolder<BlockEntityType<?>, BlockEntityType<MomentumDistributorBlockEntity>> MOMENTUM_DISTRIBUTOR_BE =
             BLOCK_ENTITIES.register("momentum_distributor",
                     () -> BlockEntityType.Builder.of(MomentumDistributorBlockEntity::new,
@@ -105,6 +122,11 @@ public final class BCRegistry {
 
     public static final DeferredItem<Item> END_ESSENCE = ITEMS.register("end_essence",
             () -> new Item(new Item.Properties()));
+
+    // 导航终端（2026-11-08，研究稿 v2 §4）：绑定核心/标定/派遣/打击标定。
+    public static final DeferredItem<com.bridgecore.nav.NavTerminalItem> NAV_TERMINAL =
+            ITEMS.register("nav_terminal",
+                    () -> new com.bridgecore.nav.NavTerminalItem(new Item.Properties().stacksTo(1)));
 
     // [firecontrol] phase 2 skeleton: block + BE + item, chat-only interaction for now
     public static final DeferredBlock<Block> FIRE_CONTROL_CORE = BLOCKS.register("fire_control_core",
@@ -172,14 +194,24 @@ public final class BCRegistry {
                     .icon(() -> new ItemStack(BRIDGE_CORE_ITEM.get()))
                     .displayItems((params, output) -> {
                         output.accept(BRIDGE_CORE_ITEM.get());
-                        output.accept(HUD_SCREEN_ITEM.get());
+                        output.accept(FIRE_CONTROL_CORE_ITEM.get());
                         output.accept(REDSTONE_PROXY_ITEM.get());
                         output.accept(MOMENTUM_DISTRIBUTOR_ITEM.get());
                         output.accept(ENERGY_EXTRACTOR_ITEM.get());
-                        output.accept(END_ESSENCE.get());
-                        output.accept(FIRE_CONTROL_CORE_ITEM.get());
+                        output.accept(HUD_SCREEN_ITEM.get());
                         output.accept(DISPLAY_GPU_ITEM.get());
                         output.accept(DISPLAY_TILE_ITEM.get());
+
+                        output.accept(END_ESSENCE.get());
+                        output.accept(NAV_TERMINAL.get());
+                        output.accept(BASIC_CAPACITY_CARD.get());
+                        output.accept(ADVANCED_CAPACITY_CARD.get());
+                        output.accept(ELITE_CAPACITY_CARD.get());
+                        output.accept(ULTIMATE_CAPACITY_CARD.get());
+                        output.accept(BASIC_THROUGHPUT_CARD.get());
+                        output.accept(ADVANCED_THROUGHPUT_CARD.get());
+                        output.accept(ELITE_THROUGHPUT_CARD.get());
+                        output.accept(ULTIMATE_THROUGHPUT_CARD.get());
                     })
                     .build());
 

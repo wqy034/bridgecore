@@ -11,6 +11,7 @@ import net.minecraft.core.HolderLookup;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.protocol.game.ClientboundBlockEntityDataPacket;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.BlockEntity;
@@ -55,6 +56,7 @@ public class HudScreenBlockEntity extends BlockEntity {
      *  packets). */
     private byte[] lastSentPixels;
     private int lastSentPaletteVersion = -1;
+    private java.util.Set<ServerPlayer> lastRecipients = java.util.Set.of();
     /** END estimate from the measured stock decline (shared with the core's CC
      *  channel — see EnduranceEstimator for the why). */
     private final EnduranceEstimator endurance = new EnduranceEstimator();
@@ -193,6 +195,8 @@ public class HudScreenBlockEntity extends BlockEntity {
         app.configureOutline(flightCore == null || flightCore.hudOutline());
         app.bindFlightStatus(flightCore == null ? -1 : flightCore.mode().ordinal(),
                 flightCore != null && flightCore.coupledOn(), flightCore != null);
+        app.bindPointing(flightCore != null && flightCore.pointingActive(),
+                flightCore != null && flightCore.pointingSettled());
         // §2.29 修订 C + suppress 核移 (2026-10-30): the suppressHudTargeting
         // OFF-forcing now lives in the flight core's tick (it owns the notch);
         // this screen just follows the mirrored value.
@@ -228,29 +232,12 @@ public class HudScreenBlockEntity extends BlockEntity {
         // SPI v3 下行: every channel's authoritative task view + the command
         // channel; the HUD's red boxes and the task line read ONLY this (黄框
         // 预锁来自上面的候选链; "HUD 发出请求" ≠ "炮塔已实锁").
-        var channelTasks = com.bridgecore.display.HudTargetProviders.pullChannelTasks(level, sub);
+        // 2026-11-09 审查 P2：任务视图只在心跳后拉取一次（此前这里先拉一遍、
+        // 心跳后又拉一遍，第一遍结果被直接覆盖）。
         int activeChannel = com.bridgecore.display.HudTargetProviders.pullActiveChannel(level, sub);
-        activeTaskView = null;
-        for (var v : channelTasks) {
-            if (v.channel() == activeChannel) {
-                activeTaskView = v;
-                break;
-            }
-        }
-        java.util.List<String> redIds = activeTaskView != null
-                && activeTaskView.mode() != com.bridgecore.display.HudTargetProvider.TaskMode.IDLE
-                ? activeTaskView.assignedTargetIds() : java.util.List.of();
+        java.util.List<String> redIds = java.util.List.of();
         String taskTag = null;
         boolean taskActive = false;
-        if (activeTaskView != null
-                && activeTaskView.mode() != com.bridgecore.display.HudTargetProvider.TaskMode.IDLE) {
-            taskActive = true;
-            taskTag = switch (activeTaskView.source()) {
-                case CONSOLE -> "FCS";
-                case HUD -> "LOCK";
-                default -> null;
-            };
-        }
         if (commandHud) {
             com.bridgecore.firecontrol.FireControlCoreBlockEntity fireCore = null;
             for (var fc : com.bridgecore.firecontrol.FireControlCoreBlockEntity.coresOf(level, sub)) {
@@ -281,7 +268,7 @@ public class HudScreenBlockEntity extends BlockEntity {
                 }
             }
         }
-        channelTasks = com.bridgecore.display.HudTargetProviders.pullChannelTasks(level, sub);
+        var channelTasks = com.bridgecore.display.HudTargetProviders.pullChannelTasks(level, sub);
         activeTaskView = null;
         for (var view : channelTasks) if (view.channel() == activeChannel) { activeTaskView = view; break; }
         taskActive = activeTaskView != null && activeTaskView.mode()
@@ -292,27 +279,47 @@ public class HudScreenBlockEntity extends BlockEntity {
         boolean preciseTask = taskActive && activeTaskView.mode()
                 == com.bridgecore.display.HudTargetProvider.TaskMode.PRECISE_LOCK;
         app.bindHudTargets(level, sub, getBlockPos(), lockSnapshot, lockIds,
-                lockFilterText, redIds, taskTag, taskActive, preciseTask, lockTargetsOff, commandHud);
+                lockFilterText, redIds, taskTag, taskActive, preciseTask, lockTargetsOff, commandHud,
+                flightCore != null ? flightCore.hudLockMaxCount()
+                        : BridgeCoreBlockEntity.HUD_LOCK_MAX_COUNT_DEFAULT);
         app.bindWeaponStatus(com.bridgecore.display.HudTargetProviders.pullWeaponStatus(
                 level, sub, getBlockPos(), facing));
-        app.render(canvas, ctx);
-
         tickCount++;
         if (tickCount % 2 == 0) {
-            byte[] raw = canvas.raw();
-            if (lastSentPixels != null && java.util.Arrays.equals(raw, lastSentPixels)
-                    && lastSentPaletteVersion == canvas.paletteVersion()) {
-                return; // frame unchanged — skip the 512 KB sync entirely
+            if (!(level instanceof ServerLevel server)) return;
+            // Shipyard chunks are not the recipients' world-space tracking chunks.
+            var center = sub != null ? sub.logicalPose().position() : null;
+            double x = center == null ? worldPosition.getX() + 0.5 : center.x();
+            double y = center == null ? worldPosition.getY() + 0.5 : center.y();
+            double z = center == null ? worldPosition.getZ() + 0.5 : center.z();
+            double radius = sub == null ? SYNC_RADIUS : ShipPairing.worldSyncRadius(sub, x, y, z);
+            double radiusSquared = radius * radius;
+            var recipients = server.getPlayers(player -> player.distanceToSqr(x, y, z) < radiusSquared);
+            if (recipients.isEmpty()) {
+                lastRecipients = java.util.Set.of();
+                return;
             }
-            lastSentPixels = raw.clone();
-            lastSentPaletteVersion = canvas.paletteVersion();
+            app.render(canvas, ctx);
+            byte[] raw = canvas.raw();
+            boolean changed = lastSentPixels == null || !java.util.Arrays.equals(raw, lastSentPixels)
+                    || lastSentPaletteVersion != canvas.paletteVersion();
+            var previous = lastRecipients;
+            lastRecipients = java.util.Set.copyOf(recipients);
+            // Periodically reseed textures evicted by client-side chunk reload.
+            if (!changed && (level.getGameTime() / 2 + worldPosition.asLong()) % 50 != 0) {
+                recipients.removeIf(previous::contains);
+                if (recipients.isEmpty()) return;
+            }
+            if (changed) {
+                lastSentPixels = raw.clone();
+                lastSentPaletteVersion = canvas.paletteVersion();
+            }
             // 2026-10-29 explicit-encoding rework: 16-color indices nibble-pack
             // to half size; the HUD's 256-entry palette (outline-text alpha
             // ladders) always exceeds a nibble, so HUD frames take RLE —
             // mostly-empty 1024² frames collapse to a few KiB. A frame still
             // over MAX_BAND_BYTES after encoding ships as band-sliced packets
-            // (the ENCODED stream is sliced; the receiver decodes once after
-            // reassembly). Raw over the cap is never sent.
+            // (the ENCODED stream is sliced; the receiver decodes once after reassembly).
             int encoding;
             byte[] data;
             if (CanvasSyncPayload.canPackNibbles(raw)) {
@@ -321,25 +328,21 @@ public class HudScreenBlockEntity extends BlockEntity {
             } else {
                 encoding = CanvasSyncPayload.ENCODING_RLE;
                 data = CanvasSyncPayload.packRle(raw);
+                if (data.length >= raw.length) {
+                    encoding = CanvasSyncPayload.ENCODING_RAW;
+                    data = raw;
+                }
             }
             int bandCount = (data.length + CanvasSyncPayload.MAX_BAND_BYTES - 1)
                     / CanvasSyncPayload.MAX_BAND_BYTES;
-            // Send from the LOGICAL center: on a ship the block lives in an untracked
-            // plot chunk; on the ground pose==actual position and this is a no-op shift.
-            double x = getBlockPos().getX() + 0.5, y = getBlockPos().getY() + 0.5, z = getBlockPos().getZ() + 0.5;
-            if (sub != null) {
-                var c = sub.logicalPose().position();
-                x = c.x(); y = c.y(); z = c.z();
-            }
             byte[] paletteBytes = CanvasSyncPayload.encodePalette(canvas.customPalette());
             for (int b = 0; b < bandCount; b++) {
                 int from = b * CanvasSyncPayload.MAX_BAND_BYTES;
                 int to = Math.min(data.length, from + CanvasSyncPayload.MAX_BAND_BYTES);
                 byte[] slice = bandCount == 1 ? data : java.util.Arrays.copyOfRange(data, from, to);
-                PacketDistributor.sendToPlayersNear((ServerLevel) level, null, x, y, z, SYNC_RADIUS,
-                        new CanvasSyncPayload(getBlockPos(), canvas.width(), canvas.height(),
-                                encoding, b, bandCount, slice, canvas.paletteVersion(),
-                                paletteBytes));
+                var frame = new CanvasSyncPayload(getBlockPos(), canvas.width(), canvas.height(),
+                        encoding, b, bandCount, slice, canvas.paletteVersion(), paletteBytes);
+                for (ServerPlayer recipient : recipients) PacketDistributor.sendToPlayer(recipient, frame);
             }
         }
     }
@@ -435,11 +438,13 @@ public class HudScreenBlockEntity extends BlockEntity {
             screenScale = mapLegacyScale(tag.getFloat("screenScale"));
         }
         if (tag.contains("calibScale")) {
-            calibX = tag.getDouble("calibX");
-            calibY = tag.getDouble("calibY");
+            // R7-6：五键各自 contains 回退，缺键不再被读成 0（旧版单一 guard
+            // 会把缺失的 calibEyeX 算成 0，v1 迁移直接归零）。
+            calibX = tag.contains("calibX") ? tag.getDouble("calibX") : calibX;
+            calibY = tag.contains("calibY") ? tag.getDouble("calibY") : calibY;
             calibScale = tag.getDouble("calibScale");
-            calibEyeX = tag.getDouble("calibEyeX");
-            calibEyeY = tag.getDouble("calibEyeY");
+            calibEyeX = tag.contains("calibEyeX") ? tag.getDouble("calibEyeX") : calibEyeX;
+            calibEyeY = tag.contains("calibEyeY") ? tag.getDouble("calibEyeY") : calibEyeY;
             // 2026-10-26 v2 migration (direct write, bypasses the GUI clamps —
             // a core push re-clamps on registration anyway; see
             // BridgeCoreBlockEntity's hudCalibV2 block for the full formula
@@ -455,9 +460,11 @@ public class HudScreenBlockEntity extends BlockEntity {
                 calibEyeY = (1.1 + oldAnchorHalf)
                         - com.bridgecore.display.HudLockBoxLayer.EYE_BASE_Y;
             }
-            calibPitchStep = tag.getDouble("calibPitchStep");
-            calibAttSize = tag.getDouble("calibAttSize");
-            calibAttBorder = tag.getDouble("calibAttBorder");
+            calibPitchStep = tag.contains("calibPitchStep")
+                    ? tag.getDouble("calibPitchStep") : calibPitchStep;
+            calibAttSize = tag.contains("calibAttSize") ? tag.getDouble("calibAttSize") : calibAttSize;
+            calibAttBorder = tag.contains("calibAttBorder")
+                    ? tag.getDouble("calibAttBorder") : calibAttBorder;
             calibInputLine = !tag.contains("calibInputLine") || tag.getBoolean("calibInputLine");
         }
         // §2.29: legacy per-screen "lockCategory" keys in old saves are simply
@@ -498,6 +505,11 @@ public class HudScreenBlockEntity extends BlockEntity {
         // through loadAdditional, and without the marker it would re-run the
         // v2 migration on already-migrated values.
         tag.putBoolean("calibV2", true);
+        // R7-6：update tag 补齐其余四键（此前客户端这四值恒 0/false）。
+        tag.putDouble("calibPitchStep", calibPitchStep);
+        tag.putDouble("calibAttSize", calibAttSize);
+        tag.putDouble("calibAttBorder", calibAttBorder);
+        tag.putBoolean("calibInputLine", calibInputLine);
         return tag;
     }
 

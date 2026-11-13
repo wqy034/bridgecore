@@ -4,12 +4,18 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 import java.util.WeakHashMap;
 
 import org.jetbrains.annotations.Nullable;
 
 import com.bridgecore.BCRegistry;
+import com.bridgecore.BridgeCoreBlockEntity;
+import com.bridgecore.BridgeCoreMod;
 import com.bridgecore.CoreDirectory;
+import com.bridgecore.PointingMode;
+import com.bridgecore.control.NavigationController;
 import com.bridgecore.firecontrol.TargetRegistry.Category;
 import com.bridgecore.firecontrol.TargetRegistry.Sighting;
 import com.bridgecore.firecontrol.TargetRegistry.Target;
@@ -18,6 +24,9 @@ import com.bridgecore.firecontrol.ballistics.SolveChain;
 import com.bridgecore.firecontrol.ballistics.Vec3;
 import com.bridgecore.firecontrol.railgun.RailgunLink;
 import com.bridgecore.menu.FireControlMenu;
+import com.bridgecore.nav.NavTerminalData;
+import com.bridgecore.network.FireControlStrikeResult;
+import com.bridgecore.network.TerminalReplyPayload;
 
 import org.joml.Vector3d;
 
@@ -34,6 +43,7 @@ import net.minecraft.nbt.StringTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.MenuProvider;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.monster.Monster;
@@ -87,7 +97,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
      *  task ENDS (rev+1, 协议 §5: 不自动改锁). Ships get the same grace — their
      *  sublevel lookup can flap on chunk reload. */
     private static final int LOCK_LOST_GRACE_TICKS = 60;
-    private final int[] preciseLostTicks = new int[CHANNEL_COUNT];
+    private final int[] preciseLostTicks = new int[WeaponGroups.MAX];
 
     private final TargetRegistry registry = new TargetRegistry();
     /** Sky-visibility scan filter (the 2026-09-23 隔墙锁 fix): ON by default,
@@ -96,36 +106,44 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
     private boolean skyFilter = true;
     /** Paired turrets, insertion-ordered (pairing order = display order). */
     private final Map<java.util.UUID, TurretUnit> turrets = new java.util.LinkedHashMap<>();
+    /** Hull-fixed guns (轴炮, docs/axis-gun-design.md): fe_railgun macro-cannon
+     *  cores (宏炮核心 — own core block, NOT CBC mounts) on the SAME main
+     *  structure as this core, no bearings — the ship is the carriage and the
+     *  flight core's pointing service aims them. Separate from turrets on
+     *  purpose: TurretUnit hard-binds SwivelTurretActuator. */
+    private final Map<java.util.UUID, FixedGun> fixedGuns = new java.util.LinkedHashMap<>();
+    /** Pointing requester identity (3c): persisted so the flight core's
+     *  override logs stay meaningful across reloads. */
+    private java.util.UUID coreUuid;
+    /** Channel currently owning our pointing request (-1 = none). Runtime only. */
+    private int pointingChannel = -1;
+    private final Map<java.util.UUID, MacroReadout> macroReadouts = new java.util.HashMap<>();
+    /** Axis-gun fire gate: actual beam axis vs target direction, degrees. */
+    static final double AXIS_GUN_FIRE_TOLERANCE_DEG = 1.5;
+    /** Pointing rate/accel defaults (pointing-execution-design §6.4; the
+     *  flight core clamps further by its own attMaxAlpha). */
+    static final double POINTING_MAX_RATE = 0.6, POINTING_MAX_ACCEL = 2.0;
+    public static final int MAX_FIXED_GUNS = 4;
     private double scanRadius = DEFAULT_SCAN_RADIUS;
     private ServerSubLevel registeredSubLevel;
     private long tickCount;
 
     // ---------------- 武器频道 + 频道任务 (§2.29 频道任务协议 v1) ----------------
-    /** Weapon channels (武器频道): turrets are assigned EXCLUSIVELY into one
-     *  channel (TurretUnit.channel). Ungrouped turrets (channel<0) answer to
-     *  nothing — 编组即指挥: no task, no aiming, no firing. Every fire entry
-     *  funnels through the FireDirector gate chain. (射速是炮塔自己的属性 —
-     *  SwivelTurretActuator.fireIntervalTicks, 用户裁决 2026-10-06: 配对在就
-     *  能调,编组不卡它。) */
-    public static final int CHANNEL_COUNT = 4;
-    /** Default channel names; the live (renameable, NBT-persisted) names are
-     *  {@link #channelNames}. Rename UI is a later batch (面板留 TODO). */
-    public static final String[] DEFAULT_CHANNEL_NAMES = {"频道一", "频道二", "频道三", "频道四"};
-    /** Per-channel display names (频道配置, NBT). */
-    private final String[] channelNames = DEFAULT_CHANNEL_NAMES.clone();
-    private final boolean[] channelAutoFire = new boolean[CHANNEL_COUNT];
+    private int channelCount = WeaponGroups.DEFAULT_COUNT;
+    private final String[] channelNames = new String[WeaponGroups.MAX];
+    private final boolean[] channelAutoFire = new boolean[WeaponGroups.MAX];
     /** 自动升格 preference (裁断稿 §5): auto-enter HUD MULTI_LOCK when the channel
      *  is IDLE and the prelock pool is valid+non-empty. ONLY into multi-lock —
      *  never precise, never firing. Manual release pauses it via the task's
      *  promoteSuppressed; recovery = another G or re-enabling this switch. */
-    private final boolean[] channelAutoPromote = {true, true, true, true};
+    private final boolean[] channelAutoPromote = new boolean[WeaponGroups.MAX];
     /** The authoritative per-channel tasks (协议 §1: 每频道至多一份, NBT 持久化). */
-    private final ChannelTask[] tasks = new ChannelTask[CHANNEL_COUNT];
+    private final ChannelTask[] tasks = new ChannelTask[WeaponGroups.MAX];
     /** Per-turret execution feedback (协议 §1): unit id → assignment stamped with
      *  the taskRev it was computed from — a rev move invalidates it IMMEDIATELY
      *  (评审 H 即时失效原则), the drive loop refuses stale-rev assignments. */
     private final Map<java.util.UUID, Assignment> turretAssignments = new java.util.HashMap<>();
-    private record Assignment(String targetId, long taskRev) {}
+    private record Assignment(String targetId, int channel, long taskRev) {}
     /** HUD prelock receive state (协议 §3 PrelockUpdate): the SHIP-WIDE candidate
      *  picture pushed by the command HUD — not per channel, not an engagement.
      *  seq is monotone (stale pushes dropped); expiry is a gameTime deadline,
@@ -139,8 +157,14 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
      *  等待中 (driveTurret 全组就位即击发并清除), hHeld = 手动持续扳机 (driveTurret
      *  AUTO 闸门链中顶替频道自动开火开关, 仍按炮塔自身装填节奏). Pure runtime;
      *  cancelled on task release / source switch / channel switch. */
-    private final boolean[] salvoWaiting = new boolean[CHANNEL_COUNT];
-    private final boolean[] hHeld = new boolean[CHANNEL_COUNT];
+    private final boolean[] salvoWaiting = new boolean[WeaponGroups.MAX];
+    private final long[] salvoRevision = new long[WeaponGroups.MAX];
+    /** P1-5: 齐射排队快照 + 超时。快照以双击时刻在册成员为准——等待期间
+     *  新配对/新挂载/新登记不纳入旧请求; 超过 10s 未就位自动取消。 */
+    private final long[] salvoStartTick = new long[WeaponGroups.MAX];
+    private final java.util.Map<Integer, java.util.Set<String>> salvoSnapshots = new java.util.HashMap<>();
+    private static final int SALVO_TIMEOUT_TICKS = 200;
+    private final boolean[] hHeld = new boolean[WeaponGroups.MAX];
     /** The channel the G/H arbitration, the volley and the panel edits target. */
     private int activeChannel;
 
@@ -209,8 +233,10 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
 
     public FireControlCoreBlockEntity(BlockPos pos, BlockState state) {
         super(BCRegistry.FIRE_CONTROL_CORE_BE.get(), pos, state);
-        for (int i = 0; i < CHANNEL_COUNT; i++) {
+        for (int i = 0; i < WeaponGroups.MAX; i++) {
             tasks[i] = new ChannelTask();
+            channelNames[i] = FireControlUiText.channel(i);
+            channelAutoPromote[i] = true;
         }
     }
 
@@ -226,7 +252,10 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
             be.scan(level, pos);
         }
         if (level instanceof ServerLevel sl) {
+            if (be.assignmentsDirty) be.recomputeAssignments(sl);
             be.driveTurret(sl);
+            be.tickAxisGuns(sl);
+            be.tickSalvoTimeouts(sl);
         }
     }
 
@@ -246,7 +275,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
      *  ~0.6s×shipVel, which is exactly the "accurate parked, hopeless while
      *  maneuvering" report of 2026-10-06. 0.1s ≈ the real solve+actuate
      *  pipeline delay. */
-    private static final SolveChain.Params DEFAULT_PARAMS = new SolveChain.Params(
+    static final SolveChain.Params DEFAULT_PARAMS = new SolveChain.Params(
             0.99, 0.05, 160, 0, -90, 90, 180, "none", 30, 0.1, 0.1, 0.05,
             false, false, 0, "-X");
     /** Tracking-loop delay lead (2026-09-17, stutter fix ③): pure position
@@ -273,7 +302,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
 
     /** Display-only stamps: prevent an old task's cached green lamp from
      * surviving a rev change, calibration, or a stopped drive loop. */
-    private record HudGateSample(long taskRev, long tick, FireDirector.GateResult gate) {}
+    private record HudGateSample(int channel, long taskRev, long tick, FireDirector.GateResult gate) {}
     private final Map<java.util.UUID, HudGateSample> hudGateSamples = new java.util.HashMap<>();
 
     /** 双击齐射候选 (协议 §6): one channel turret + its VOLLEY-gate verdict
@@ -289,9 +318,210 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
      *  pin/follow priority is gone. Each unit solves from its OWN muzzle
      *  position; the actuator also needs the no-target ticks for calibration,
      *  so it runs whenever paired. */
+    private int salvoFiredGroups;
+    private @Nullable MarkedStrike markedStrike;
+
+    /** Queues a confirmed preview without changing the ordinary channel task. */
+    public @Nullable String startMarkedStrike(ServerPlayer player, UUID terminal, BridgeCoreBlockEntity flight,
+            ServerSubLevel ship, NavTerminalData.Mark mark, StrikePreview.Roster roster, int channel,
+            StrikePreview.Mode weaponMode, Set<UUID> selected, @Nullable StrikePreview.PosePlan posePlan, boolean quick) {
+        return startCoordinateStrike(player, new MarkedStrike.Terminal(terminal, mark, quick), flight, ship, mark.pos(), roster,
+                channel, weaponMode, selected, posePlan);
+    }
+
+    public @Nullable String startCoordinateStrike(ServerPlayer player, FireControlMenu menu, ServerSubLevel ship,
+            BlockPos target, StrikePreview.Roster roster, int channel, StrikePreview.Mode weaponMode, Set<UUID> selected, @Nullable StrikePreview.PosePlan posePlan) {
+        if (menu.strikeCore(player) != this) return "火控界面已关闭";
+        BridgeCoreBlockEntity flight = null;
+        double nearest = Double.POSITIVE_INFINITY;
+        for (var candidate : CoreDirectory.coresOf(ship)) {
+            if (candidate.isRemoved() || candidate.getLevel() != player.serverLevel()) continue;
+            double distance = candidate.getBlockPos().distSqr(worldPosition);
+            if (distance < nearest) {
+                flight = candidate;
+                nearest = distance;
+            }
+        }
+        if (flight == null) return "本船没有可用的飞控核心";
+        return startCoordinateStrike(player, new MarkedStrike.Console(menu), flight, ship, target, roster, channel,
+                weaponMode, selected, posePlan);
+    }
+
+    private @Nullable String startCoordinateStrike(ServerPlayer player, MarkedStrike.Origin origin,
+            BridgeCoreBlockEntity flight, ServerSubLevel ship, BlockPos target, StrikePreview.Roster roster,
+            int channel, StrikePreview.Mode weaponMode, Set<UUID> selected, @Nullable StrikePreview.PosePlan posePlan) {
+        ServerLevel level = player.serverLevel();
+        if (markedStrike != null) return "已有标定打击正在瞄准";
+        if (flight.telemetrySnapshot() == null) return "飞控采样不可用";
+        if (flight.manualFlightInputSince(level.getGameTime() - 1)) return "驾驶员正在操纵飞船";
+        if (!markedChannelAvailable(channel, selected, weaponMode)) return "炮位或频道已被其他火控任务占用";
+        boolean poseStrike = weaponMode == StrikePreview.Mode.TURRET_POSE;
+        if (poseStrike || weaponMode == StrikePreview.Mode.AXIS_BEAM) {
+            if (flight.mode() != BridgeCoreBlockEntity.ControlMode.STARSHIP) return "请先启用 STARSHIP 舰体指向";
+            if (axisStrikeBusy(flight, null)) return "舰体正在执行指向或导航任务";
+        }
+        StrikePreview.Assessment assessment = null;
+        if (poseStrike) {
+            if (posePlan == null || !ship.getUniqueId().equals(posePlan.ship()) || !selected.equals(posePlan.turrets())) {
+                return "确认的舰姿或炮位已失效，请重新试算";
+            }
+        } else {
+            assessment = StrikePreview.assess(level, ship, roster, channel, weaponMode,
+                    target, selected, StrikePreview.SightCheck.ESTIMATED);
+            if (!assessment.executableWeapons().equals(selected)) return MarkedStrike.unavailable(assessment);
+        }
+        markedStrike = new MarkedStrike(player, origin, flight, ship, target, channel, roster.revision(),
+                weaponMode, selected, assessment, posePlan);
+        for (var id : selected) {
+            turretGate.remove(id);
+            hudGateSamples.remove(id);
+        }
+        return null;
+    }
+
+    boolean markedChannelAvailable(int channel, Set<UUID> selected, StrikePreview.Mode weaponMode) {
+        if (channel < 0 || channel >= channelCount || selected.isEmpty()) return false;
+        if (markedGroupBusy(channel)) return false;
+        for (var id : selected) {
+            int groups;
+            if (weaponMode == StrikePreview.Mode.AXIS_BEAM) {
+                FixedGun gun = fixedGuns.get(id);
+                if (gun == null || !gun.belongsTo(channel)) return false;
+                groups = gun.groups();
+            } else {
+                TurretUnit unit = turrets.get(id);
+                if (unit == null || !unit.belongsTo(channel) || !unit.actuator().isPaired()) return false;
+                groups = unit.groups();
+            }
+            for (int members = groups & WeaponGroups.validMask(channelCount); members != 0; members &= members - 1) {
+                int member = Integer.numberOfTrailingZeros(members);
+                if (markedGroupBusy(member)) return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean markedGroupBusy(int channel) {
+        return tasks[channel].mode() != ChannelTask.Mode.IDLE || salvoWaiting[channel] || hHeld[channel];
+    }
+
+    boolean axisStrikeBusy(BridgeCoreBlockEntity flight, @Nullable UUID requester) {
+        var navigation = flight.navigationStatus();
+        if (flight.pointingActiveExcept(requester) || (navigation != null && navigation.phase() == NavigationController.Phase.ACTIVE)) return true;
+        for (var gun : fixedGuns.values()) {
+            int group = commandGroup(gun);
+            if (group >= 0 && tasks[group].mode() == ChannelTask.Mode.PRECISE_LOCK) return true;
+        }
+        return false;
+    }
+
+    public @Nullable String cancelMarkedStrike(ServerPlayer player, UUID terminal) {
+        var strike = markedStrike;
+        if (strike == null || !(strike.origin instanceof MarkedStrike.Terminal origin)
+                || !origin.id().equals(terminal) || !strike.player.equals(player.getUUID())) return null;
+        return abortMarkedStrike(player.serverLevel(), "标定打击已取消");
+    }
+
+    public @Nullable String cancelCoordinateStrike(ServerPlayer player, FireControlMenu menu) {
+        var strike = markedStrike;
+        if (strike == null || !strike.origin.equals(new MarkedStrike.Console(menu))
+                || !strike.player.equals(player.getUUID())) return null;
+        return abortMarkedStrike(player.serverLevel(), "标定打击已取消");
+    }
+
+    private String abortMarkedStrike(ServerLevel level, String message) {
+        if (markedStrike != null && markedStrike.axisSubmitted() && markedStrike.axisWarmingUp()) {
+            message += "，已接受开火的轴炮继续原生预热";
+        }
+        finishMarkedStrike(level, message);
+        return message;
+    }
+
+    private void finishMarkedStrike(ServerLevel level, String message) {
+        finishMarkedStrike(level, message, false);
+    }
+
+    private void finishMarkedStrike(ServerLevel level, String message, boolean levelAfterRelease) {
+        var strike = markedStrike;
+        if (strike == null) return;
+        markedStrike = null;
+        strike.releasePointing(levelAfterRelease);
+        reportMarkedStrike(level, strike, message);
+    }
+
+    private void reportMarkedStrike(ServerLevel level, MarkedStrike strike, String message) {
+        sendMarkedStrikeReport(level, strike, message);
+    }
+
+    private static void sendMarkedStrikeReport(ServerLevel level, MarkedStrike strike, String message) {
+        var player = level.getServer().getPlayerList().getPlayer(strike.player);
+        if (player == null) return;
+        if (strike.origin instanceof MarkedStrike.Terminal terminal) {
+            TerminalReplyPayload.send(player, terminal.id(), message);
+        } else {
+            var console = (MarkedStrike.Console) strike.origin;
+            FireControlStrikeResult.finished(player, console.menu(), message);
+        }
+    }
+
+    private void fireMarkedStrike(ServerLevel level, MarkedStrike strike) {
+        if (strike.isAxis()) {
+            fireMarkedAxisStrike(level, strike);
+            return;
+        }
+        markedStrike = null; // Consume the authorization before invoking any mount.
+        int fired = 0;
+        int total = 0;
+        for (var shots : strike.shots()) total += shots.mounts().size();
+        try {
+            for (var shots : strike.shots()) fired += fireMounts(level, shots.turret(), shots.mounts(), shots.handles());
+            String result = fired == 0 ? "标定打击中止，武器拒绝开火"
+                    : "标定打击已执行，炮座接受 " + fired + "/" + total + " 发" + (strike.isPose() ? "，舰体开始找平" : "");
+            reportMarkedStrike(level, strike, result);
+        } catch (RuntimeException failure) {
+            BridgeCoreMod.LOGGER.warn("[fire-control] marked strike weapon call failed at {}", worldPosition, failure);
+            reportMarkedStrike(level, strike, "标定打击结束，武器接口异常，请查看服务器日志");
+        } finally {
+            strike.releasePointing(strike.isPose() && fired > 0);
+        }
+    }
+
+    private void fireMarkedAxisStrike(ServerLevel level, MarkedStrike strike) {
+        try {
+            int accepted = strike.submitAxis(level.getGameTime());
+            if (accepted == 0) {
+                finishMarkedStrike(level, "标定打击中止，轴炮拒绝开火");
+                return;
+            }
+            String message = "轴炮已接受 " + accepted + "/" + strike.selected.size() + " 发，预热期间保持舰体指向";
+            sendMarkedStrikeReport(level, strike, message);
+        } catch (RuntimeException failure) {
+            BridgeCoreMod.LOGGER.warn("[fire-control] marked axis strike weapon call failed at {}", worldPosition, failure);
+            abortMarkedStrike(level, "标定打击结束，武器接口异常，请查看服务器日志");
+        }
+    }
+
     private void driveTurret(ServerLevel level) {
-        if (turrets.isEmpty()) return;
+        salvoFiredGroups = 0;
         tickTaskWatchdogs(level);
+        for (int group = 0; group < channelCount; group++) {
+            if (salvoWaiting[group] && salvoRevision[group] != tasks[group].rev()) salvoWaiting[group] = false;
+        }
+        var strike = markedStrike;
+        if (strike != null) {
+            String reason = strike.beginTick(level, this);
+            if (reason != null) {
+                abortMarkedStrike(level, "标定打击中止，" + reason);
+                strike = null;
+            } else if (strike.axisSubmitted() && !strike.axisWarmingUp()) {
+                boolean fired = strike.axisFired();
+                finishMarkedStrike(level, fired ? "轴炮打击结束，舰体开始找平" : "轴炮预热结束，未发射，舰体指向已交还", fired);
+                strike = null;
+            } else if (strike.axisSubmitted() && strike.axisWarmupTimedOut(level.getGameTime())) {
+                abortMarkedStrike(level, "轴炮预热等待超时，舰体指向已交还");
+                strike = null;
+            }
+        }
         Map<Integer, List<SalvoEntry>> salvoCandidates = null; // lazy: most ticks have no pending salvo
         for (TurretUnit unit : turrets.values()) {
             SwivelTurretActuator turret = unit.actuator();
@@ -308,8 +538,12 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
                 if (codes[m] != RailgunLink.STATUS_READY) allReady = false;
             }
             turretMountStatus.put(unit.id(), codes);
+            if (strike != null && strike.controls(unit)) {
+                strike.drive(level, unit, mounts, handles, allReady);
+                continue;
+            }
             // Per-channel task resolution (§2.29 驱动回路)
-            int ch = unit.channel();
+            int ch = commandGroup(unit.groups());
             ChannelTask task = ch >= 0 ? tasks[ch] : null;
             Vec3 des = null;
             Target aimTarget = null;
@@ -319,7 +553,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
                     case MULTI_LOCK -> {
                         Assignment a = turretAssignments.get(unit.id());
                         // rev 不匹配 = 任务已变更而分配未重算 — 作废,不瞄准
-                        if (a != null && a.taskRev() == task.rev()) {
+                        if (a != null && a.channel() == ch && a.taskRev() == task.rev()) {
                             aimTarget = resolveTaskTarget(a.targetId());
                         }
                     }
@@ -359,7 +593,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
             FireDirector.GateResult gate = FireDirector.evaluate(
                     new FireDirector.Input(FireDirector.Mode.AUTO,
                             des != null && !Double.isNaN(err),
-                            ch >= 0, ch >= 0 && (channelAutoFire[ch] || hHeld[ch]),
+                            ch >= 0, ch >= 0 && !salvoWaiting[ch] && (channelAutoFire[ch] || hHeld[ch]),
                             allReady, firstBadDetail(mounts, codes),
                             err, turret.isInArc(),
                             level.getGameTime() - turret.lastFireTick() >= turret.fireIntervalTicks()),
@@ -368,7 +602,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
                         return muzzle != null && lineOfFireBlocked(level, turret, muzzle, desF);
                     });
             turretGate.put(unit.id(), gate);
-            hudGateSamples.put(unit.id(), new HudGateSample(task == null ? -1 : task.rev(),
+            hudGateSamples.put(unit.id(), new HudGateSample(ch, task == null ? -1 : task.rev(),
                     level.getGameTime(), gate));
             if (gate.fires()) {
                 fireMounts(level, turret, mounts, handles);
@@ -379,11 +613,30 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
             // VOLLEY gate chain (operator's explicit request — no cadence /
             // channel-switch gates, LOF along the barrel's ACTUAL direction).
             // Mountless turrets can't fire and don't veto the salvo.
-            if (ch >= 0 && salvoWaiting[ch] && !mounts.isEmpty()) {
+            // P1-5 排队快照: 只收双击时刻在册的炮塔与炮座; 快照外的新成员
+            // 既不参与也不否决; 快照内的炮塔但无快照炮座 = 不参与不否决。
+            java.util.Set<String> snapshot = ch >= 0 ? salvoSnapshots.get(ch) : null;
+            if (ch >= 0 && salvoWaiting[ch] && !mounts.isEmpty()
+                    && snapshot != null && snapshot.contains(unit.id().toString())) {
+                List<SwivelTurretActuator.Mount> sm = new ArrayList<>();
+                List<Object> sh = new ArrayList<>();
+                List<Integer> sc = new ArrayList<>();
+                for (int m = 0; m < mounts.size(); m++) {
+                    if (!snapshot.contains(unit.id() + "#" + mounts.get(m).no())) continue;
+                    sm.add(mounts.get(m)); sh.add(handles[m]); sc.add(codes[m]);
+                }
+                if (sm.isEmpty()) continue;
+                int[] scodes = new int[sc.size()];
+                boolean allReadyS = true;
+                Object[] shandles = sh.toArray();
+                for (int m = 0; m < sc.size(); m++) {
+                    scodes[m] = sc.get(m);
+                    if (scodes[m] != RailgunLink.STATUS_READY) allReadyS = false;
+                }
                 FireDirector.GateResult vgate = FireDirector.evaluate(
                         new FireDirector.Input(FireDirector.Mode.VOLLEY,
                                 !Double.isNaN(err), true, true,
-                                allReady, firstBadDetail(mounts, codes),
+                                allReadyS, firstBadDetail(sm, scodes),
                                 err, turret.isInArc(), true),
                         () -> {
                             Vec3 muzzle = cannonWorldPos(level, turret);
@@ -393,37 +646,47 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
                         });
                 if (salvoCandidates == null) salvoCandidates = new LinkedHashMap<>();
                 salvoCandidates.computeIfAbsent(ch, k -> new ArrayList<>())
-                        .add(new SalvoEntry(turret, mounts, handles, vgate));
+                        .add(new SalvoEntry(turret, sm, shandles, vgate));
             }
         }
-        // 双击齐射执行: fires ONLY when EVERY offered turret of the channel
-        // passes (全组就位才齐射); a failed gate keeps the request waiting
-        // (HUD narrates via channelSalvoWaiting; cancellations live in
-        // releaseTask/setActiveChannel).
-        if (salvoCandidates != null) {
-            for (Map.Entry<Integer, List<SalvoEntry>> e : salvoCandidates.entrySet()) {
-                int ch2 = e.getKey();
-                List<SalvoEntry> entries = e.getValue();
-                if (entries.isEmpty()) {
-                    salvoWaiting[ch2] = false;
-                    notifyNearby(level, "[火控核心] " + channelNames[ch2]
-                            + ": 齐射请求取消(频道内无可击发炮塔)");
-                    setChanged();
-                    continue;
+        if (strike != null && strike.allSettled()) {
+            String reason = strike.checkBeforeFire(level, this);
+            if (reason != null) finishMarkedStrike(level, "标定打击中止，" + reason);
+            else if (strike.stillAimed()) fireMarkedStrike(level, strike);
+        }
+        for (int group = 0; group < channelCount; group++) {
+            if (!salvoWaiting[group]) continue;
+            List<SalvoEntry> entries = salvoCandidates == null ? List.of()
+                    : salvoCandidates.getOrDefault(group, List.of());
+            if (entries.stream().anyMatch(entry -> !entry.gate().fires())) continue;
+            List<Object> macros = new ArrayList<>();
+            boolean ready = true;
+            for (FixedGun gun : fixedGuns.values()) {
+                if (tasks[group].mode() != ChannelTask.Mode.PRECISE_LOCK || commandGroup(gun) != group) continue;
+                // P1-5: 快照外新登记的轴炮不纳入本次请求, 也不否决
+                java.util.Set<String> snap = salvoSnapshots.get(group);
+                if (snap != null && !snap.contains(gun.id().toString())) continue;
+                Object handle = RailgunLink.macroAt(level, gun.gunPos());
+                int hardware = RailgunLink.macroStatusCode(handle);
+                if (!macroAim(level, group, handle, hardware).ready()) {
+                    ready = false;
+                    break;
                 }
-                boolean allPass = true;
-                for (SalvoEntry en : entries) {
-                    if (!en.gate().fires()) { allPass = false; break; }
-                }
-                if (!allPass) continue; // 继续等待
-                for (SalvoEntry en : entries) {
-                    fireMounts(level, en.turret(), en.mounts(), en.handles());
-                }
-                salvoWaiting[ch2] = false;
-                notifyNearby(level, "[火控核心] 齐射(" + channelNames[ch2]
-                        + "): 双击请求 × " + entries.size() + " 炮塔全组就位击发");
-                setChanged();
+                macros.add(handle);
             }
+            if (!ready) continue;
+            salvoWaiting[group] = false;
+            salvoFiredGroups |= WeaponGroups.bit(group);
+            if (entries.isEmpty() && macros.isEmpty()) {
+                notifyNearby(level, "[火控核心] " + channelNames[group] + "：齐射取消，当前组没有可指挥的武器");
+            } else {
+                for (SalvoEntry entry : entries) fireMounts(level, entry.turret(), entry.mounts(), entry.handles());
+                int fired = 0;
+                for (Object macro : macros) if (RailgunLink.macroFire(macro) == null) fired++;
+                notifyNearby(level, "[火控核心] " + channelNames[group] + "：齐射已执行，炮塔 "
+                        + entries.size() + "，宏炮 " + fired + "/" + macros.size() + " 接受开火请求");
+            }
+            setChanged();
         }
     }
 
@@ -451,10 +714,8 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         salvoWaiting[ch] = false;
         hHeld[ch] = false;
         preciseLostTicks[ch] = 0;
-        turretAssignments.keySet().removeIf(id -> {
-            TurretUnit u = turrets.get(id);
-            return u != null && u.channel() == ch;
-        });
+        turretAssignments.values().removeIf(a -> a.channel() == ch);
+        assignmentsDirty = true;
         setChanged();
     }
 
@@ -476,7 +737,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         if (prelockExpiryTick != Long.MIN_VALUE && level.getGameTime() > prelockExpiryTick) {
             prelockExpiryTick = Long.MIN_VALUE;
             prelockIds = List.of();
-            for (int ch = 0; ch < CHANNEL_COUNT; ch++) {
+            for (int ch = 0; ch < channelCount; ch++) {
                 if (tasks[ch].source() == ChannelTask.Source.HUD) {
                     releaseTask(ch);
                 }
@@ -489,11 +750,11 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
      *  有效非空 → HUD MULTI_LOCK. 升格只进多实锁,永不进精确锁,也不授权开火. */
     private void maybeAutoPromote(ServerLevel level) {
         if (!prelockValid(level)) return;
-        for (int ch = 0; ch < CHANNEL_COUNT; ch++) {
+        for (int ch = 0; ch < channelCount; ch++) {
             ChannelTask task = tasks[ch];
             if (channelAutoPromote[ch] && !task.promoteSuppressed()
                     && task.mode() == ChannelTask.Mode.IDLE
-                    && pairedCountOf(ch) > 0) { // 空频道升格 = 无意义任务抖动
+                    && hasReadyTurretMember(ch)) {
                 task.toMulti(ChannelTask.Source.HUD);
                 setChanged();
                 recomputeAssignments(level); // rev 变化 → 立即重算 (评审 H)
@@ -501,11 +762,16 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         }
     }
 
+    private boolean hasReadyTurretMember(int group) {
+        for (TurretUnit unit : turrets.values()) if (unit.belongsTo(group) && unit.isReady()) return true;
+        return false;
+    }
+
     /** Precise-lock watchdogs, one per channel (the old single-lock watchdog
      *  generalized): a PRECISE_LOCK target that stays unresolvable for
      *  LOCK_LOST_GRACE_TICKS ends the task — 不自动改锁 (协议 §5). */
     private void tickTaskWatchdogs(ServerLevel level) {
-        for (int ch = 0; ch < CHANNEL_COUNT; ch++) {
+        for (int ch = 0; ch < channelCount; ch++) {
             ChannelTask task = tasks[ch];
             if (task.mode() != ChannelTask.Mode.PRECISE_LOCK) {
                 preciseLostTicks[ch] = 0;
@@ -538,7 +804,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         prelockIds = hudEnabled ? List.copyOf(ids) : List.of();
         prelockExpiryTick = hudEnabled ? sl.getGameTime() + Math.max(1, ttlTicks) : Long.MIN_VALUE;
         if (!hudEnabled) {
-            for (int ch = 0; ch < CHANNEL_COUNT; ch++) {
+            for (int ch = 0; ch < channelCount; ch++) {
                 if (tasks[ch].source() == ChannelTask.Source.HUD) {
                     releaseTask(ch);
                 }
@@ -558,8 +824,9 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
      *  来源,再查 HUD 候选。焦点取准星突出候选(飞控侧给 focusId); 长按无焦点
      *  不动作。channel 越界直接丢弃。Server thread (飞控侧直调核心). */
     public void gPress(boolean longPress, @Nullable String focusId, int channel) {
-        if (channel < 0 || channel >= CHANNEL_COUNT) return; // 修订 G: 越界丢弃
+        if (channel < 0 || channel >= channelCount) return; // 修订 G: 越界丢弃
         if (!(getLevel() instanceof ServerLevel sl)) return;
+        if (markedStrike != null && markedStrike.channel == channel) abortMarkedStrike(sl, "火控手动接管，标定打击已取消");
         int ch = channel;
         ChannelTask task = tasks[ch];
         String chName = channelNames[ch];
@@ -637,7 +904,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
      *  nextId 可解析。不隐式接管 FCS 任务(接管仍由长 G 完成),不创建任务。
      *  Server thread (飞控侧直调核心). */
     public void cyclePreciseTarget(int channel, String nextId, long expectedTaskRev) {
-        if (channel < 0 || channel >= CHANNEL_COUNT) return;
+        if (channel < 0 || channel >= channelCount) return;
         if (!(getLevel() instanceof ServerLevel sl)) return;
         ChannelTask task = tasks[channel];
         if (task.source() != ChannelTask.Source.HUD
@@ -662,8 +929,11 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
     public enum HPressKind { CLICK, HOLD_START, HOLD_END, DOUBLE }
 
     public void hPress(HPressKind kind, int channel) {
-        if (channel < 0 || channel >= CHANNEL_COUNT) return; // 修订 G: 越界丢弃
+        if (channel < 0 || channel >= channelCount) return; // 修订 G: 越界丢弃
         if (!(getLevel() instanceof ServerLevel sl)) return;
+        if (markedStrike != null && markedStrike.channel == channel && kind != HPressKind.HOLD_END) {
+            abortMarkedStrike(sl, "火控手动接管，标定打击已取消");
+        }
         switch (kind) {
             case CLICK -> {
                 String msg = fireVolley(sl, channel);
@@ -678,14 +948,45 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
                             + " 无任务 — 双击齐射请求未登记(H 是扳机,不搜敌、不改任务)");
                 } else if (!salvoWaiting[channel]) {
                     salvoWaiting[channel] = true;
+                    salvoRevision[channel] = tasks[channel].rev();
+                    salvoStartTick[channel] = sl.getGameTime();
+                    salvoSnapshots.put(channel, snapshotSalvoMembers(channel));
                     notifyNearby(sl, "[火控核心] " + channelNames[channel]
-                            + ": 齐射请求已登记,全组就位即击发");
+                            + ": 齐射请求已登记,全组就位即击发(10s 未就位自动取消)");
                 }
             }
         }
         setChanged();
     }
 
+    /** P1-5 排队快照: 双击时刻在册的频道成员(炮塔 id + 炮座号 + 轴炮 id)。
+     *  等待期间新配对/新挂载/新登记不纳入本次请求。 */
+    private java.util.Set<String> snapshotSalvoMembers(int ch) {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        for (TurretUnit u : turrets.values()) {
+            if (commandGroup(u.groups()) != ch) continue;
+            out.add(u.id().toString());
+            for (var m : u.actuator().mounts()) out.add(u.id() + "#" + m.no());
+        }
+        for (FixedGun g : fixedGuns.values()) {
+            if (commandGroup(g) != ch) continue;
+            out.add(g.id().toString());
+        }
+        return out;
+    }
+
+    /** P1-5: 齐射等待 10s 超时——有成员但长期不就位不能永久挂单。 */
+    private void tickSalvoTimeouts(ServerLevel sl) {
+        for (int ch = 0; ch < channelCount; ch++) {
+            if (salvoWaiting[ch] && sl.getGameTime() - salvoStartTick[ch] > SALVO_TIMEOUT_TICKS) {
+                salvoWaiting[ch] = false;
+                salvoSnapshots.remove(ch);
+                notifyNearby(sl, "[火控核心] " + channelNames[ch]
+                        + ": 齐射等待超时(10s),已取消——请重新双击");
+                setChanged();
+            }
+        }
+    }
     /** Display label for chat feedback (id → label, falls back to the id). */
     private String labelOf(String id) {
         Target t = registry.targetById(id);
@@ -729,22 +1030,24 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
      *  gated on every mount being READY. Any mount rejecting the shot lands
      *  in lastFireNote; a clean turret-wide volley clears it and paces the
      *  cooldown. */
-    private void fireMounts(ServerLevel level, SwivelTurretActuator turret,
+    private int fireMounts(ServerLevel level, SwivelTurretActuator turret,
                             List<SwivelTurretActuator.Mount> mounts, Object[] handles) {
         StringBuilder rejected = null;
+        int fired = 0;
         for (int m = 0; m < mounts.size(); m++) {
             String r = MountLinks.active().fire(handles[m]); // atomic: readiness re-run inside
             if (r != null) {
                 if (rejected == null) rejected = new StringBuilder();
                 else rejected.append('/');
                 rejected.append("炮座").append(mounts.get(m).no()).append(' ').append(r);
-            }
+            } else fired++;
         }
         if (rejected == null) {
             turret.noteFired(level.getGameTime());
         } else {
             turret.noteFireRejected(rejected.toString());
         }
+        return fired;
     }
 
     /** 20 Hz fast path for the LOCKED target (2026-09-17, moving-target stutter
@@ -881,7 +1184,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
     }
 
     /** Slab-test a ray against a world AABB; {tEnter, tExit} (tEnter >= 0) or null. */
-    private static double @Nullable [] rayAabb(Vec3 o, Vec3 d, double minX, double minY, double minZ,
+    static double @Nullable [] rayAabb(Vec3 o, Vec3 d, double minX, double minY, double minZ,
                                                double maxX, double maxY, double maxZ) {
         double[] oa = {o.x(), o.y(), o.z()};
         double[] da = {d.x(), d.y(), d.z()};
@@ -943,6 +1246,20 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         return replaced;
     }
 
+    public boolean renameTurret(java.util.UUID id, String requested) {
+        var unit = turrets.get(id);
+        String name = WeaponGroups.cleanName(requested);
+        if (unit == null || name.isEmpty()) return false;
+        for (var other : turrets.values()) {
+            if (other != unit && other.name().equals(name)) return false;
+        }
+        if (!unit.name().equals(name)) {
+            unit.rename(name);
+            setChanged();
+        }
+        return true;
+    }
+
     private String nextTurretName() {
         java.util.Set<String> names = new java.util.HashSet<>();
         for (TurretUnit u : turrets.values()) names.add(u.name());
@@ -992,16 +1309,32 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
     }
 
     /** Explicit membership edit; selecting a channel does not change the
-     *  operator's active channel or any channel-wide fire preference. */
-    public void setTurretChannel(int row, int channel) {
-        if (channel < -1 || channel >= CHANNEL_COUNT) return;
-        TurretUnit u = turretByIndex(row);
-        if (u == null || u.channel() == channel) return;
-        u.setChannel(channel);
-        turretAssignments.remove(u.id());
-        hudGateSamples.remove(u.id());
+     *  operator's active channel or any channel-wide fire preference.
+     *  N2: returns false when the mutual-exclusion rule (轴炮/炮塔不同频道)
+     *  rejected the edit — callers must give the player a receipt. */
+    public boolean setTurretChannel(int row, int channel) {
+        if (channel < -1 || channel >= channelCount) return false;
+        TurretUnit unit = turretByIndex(row);
+        return unit != null && setTurretGroups(unit, WeaponGroups.bit(channel));
+    }
+
+    public boolean editTurretGroup(int row, int group, boolean join) {
+        if (group < 0 || group >= channelCount) return false;
+        TurretUnit unit = turretByIndex(row);
+        if (unit == null) return false;
+        int bit = WeaponGroups.bit(group);
+        return setTurretGroups(unit, join ? unit.groups() | bit : unit.groups() & ~bit);
+    }
+
+    private boolean setTurretGroups(TurretUnit unit, int groups) {
+        if (unit.groups() == groups) return true;
+        if ((groups & ~unit.groups() & fixedGunGroups()) != 0) return false; // N2: 互斥拒绝要回执
+        unit.setGroups(groups);
+        turretAssignments.remove(unit.id());
+        hudGateSamples.remove(unit.id());
         if (getLevel() instanceof ServerLevel sl) recomputeAssignments(sl);
         setChanged();
+        return true;
     }
 
     /** All paired turrets in pairing order (panel/chat status, scan exclusion). */
@@ -1026,7 +1359,6 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         for (TurretUnit u : turrets.values()) {
             if (i++ == row) {
                 u.actuator().setArc(param, valueDeg);
-                setChanged();
                 return;
             }
         }
@@ -1040,8 +1372,8 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         int i = 0;
         for (TurretUnit u : turrets.values()) {
             if (i++ == row) {
-                if (u.channel() < 0) return null;
-                channelAutoFire[u.channel()] = !channelAutoFire[u.channel()];
+                if (commandGroup(u.groups()) < 0) return null;
+                channelAutoFire[commandGroup(u.groups())] = !channelAutoFire[commandGroup(u.groups())];
                 setChanged();
                 return u;
             }
@@ -1051,6 +1383,43 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
 
     // ---------------- 武器频道: panel/menu-facing state ----------------
 
+    public int channelCount() { return channelCount; }
+
+    public int commandGroup(int groups) {
+        return commandGroup(groups, false);
+    }
+
+    public int commandGroup(FixedGun gun) {
+        return commandGroup(gun.groups(), true);
+    }
+
+    private int commandGroup(int groups, boolean macro) {
+        groups &= WeaponGroups.validMask(channelCount);
+        int engaged = 0;
+        for (int remaining = groups; remaining != 0; remaining &= remaining - 1) {
+            int group = Integer.numberOfTrailingZeros(remaining);
+            ChannelTask.Mode mode = tasks[group].mode();
+            if (macro ? mode == ChannelTask.Mode.PRECISE_LOCK : mode != ChannelTask.Mode.IDLE)
+                engaged |= WeaponGroups.bit(group);
+        }
+        return WeaponGroups.owner(groups, activeChannel, engaged);
+    }
+
+    public boolean addChannel() {
+        if (channelCount == WeaponGroups.MAX) return false;
+        setActiveChannel(channelCount++);
+        setChanged();
+        return true;
+    }
+
+    public boolean renameChannel(int channel, String requested) {
+        String name = WeaponGroups.cleanName(requested);
+        if (channel < 0 || channel >= channelCount || name.isEmpty()) return false;
+        channelNames[channel] = name;
+        setChanged();
+        return true;
+    }
+
     public int activeChannel() {
         return activeChannel;
     }
@@ -1059,7 +1428,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
      *  旧组手动扳机与齐射等待; 任务撤销/换源/切组即取消等待)。任务本身跨切组
      *  保留 — X 只是选择指挥对象。实际取消到东西时给 64m 通报。 */
     public void setActiveChannel(int ch) {
-        if (ch >= 0 && ch < CHANNEL_COUNT && ch != activeChannel) {
+        if (ch >= 0 && ch < channelCount && ch != activeChannel) {
             if ((salvoWaiting[activeChannel] || hHeld[activeChannel])
                     && getLevel() instanceof ServerLevel sl) {
                 notifyNearby(sl, "[火控核心] " + channelNames[activeChannel]
@@ -1068,6 +1437,8 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
             salvoWaiting[activeChannel] = false;
             hHeld[activeChannel] = false;
             activeChannel = ch;
+            macroReadouts.clear();
+            if (getLevel() instanceof ServerLevel sl) recomputeAssignments(sl);
             setChanged();
         }
     }
@@ -1077,7 +1448,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
      *  每座核心调本方法(多核心船各核心同步换频道, 评审 F), 飞控不维护
      *  频道状态副本, 显示以快照为准。 */
     public void cycleChannel() {
-        setActiveChannel((activeChannel + 1) % CHANNEL_COUNT);
+        setActiveChannel((activeChannel + 1) % channelCount);
     }
 
     /** The authoritative task of a channel (协议 §1). */
@@ -1087,20 +1458,20 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
 
     /** Channel display name (NBT-persisted; rename UI 下批). */
     public String channelName(int ch) {
-        return ch >= 0 && ch < CHANNEL_COUNT ? channelNames[ch] : "?";
+        return ch >= 0 && ch < channelCount ? channelNames[ch] : "?";
     }
 
     /** Read-only scheduler flag for HUD narration (no request is issued). */
     public boolean channelSalvoWaiting(int ch) {
-        return ch >= 0 && ch < CHANNEL_COUNT && salvoWaiting[ch];
+        return ch >= 0 && ch < channelCount && salvoWaiting[ch];
     }
 
     public boolean channelAutoFire(int ch) {
-        return ch >= 0 && ch < CHANNEL_COUNT && channelAutoFire[ch];
+        return ch >= 0 && ch < channelCount && channelAutoFire[ch];
     }
 
     public void toggleChannelAutoFire(int ch) {
-        if (ch >= 0 && ch < CHANNEL_COUNT) {
+        if (ch >= 0 && ch < channelCount) {
             channelAutoFire[ch] = !channelAutoFire[ch];
             setChanged();
         }
@@ -1110,11 +1481,11 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
      *  HUD 多实锁。偏好翻转不 bump rev,也不撤销既有任务 — 升格只是
      *  PRELOCK→多实锁 的省键入口,已建立的任务(无论来源)不受影响。 */
     public boolean channelAutoPromote(int ch) {
-        return ch >= 0 && ch < CHANNEL_COUNT && channelAutoPromote[ch];
+        return ch >= 0 && ch < channelCount && channelAutoPromote[ch];
     }
 
     public void toggleChannelAutoPromote(int ch) {
-        if (ch >= 0 && ch < CHANNEL_COUNT) {
+        if (ch >= 0 && ch < channelCount) {
             channelAutoPromote[ch] = !channelAutoPromote[ch];
             if (channelAutoPromote[ch]) {
                 // 重新启用升格 = 人工暂停的恢复入口 (裁断稿 §5; 不 bump rev)
@@ -1129,7 +1500,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
     public int pairedCountOf(int ch) {
         int n = 0;
         for (TurretUnit u : turrets.values()) {
-            if (u.channel() == ch && u.actuator().isPaired()) n++;
+            if (u.belongsTo(ch) && u.actuator().isPaired()) n++;
         }
         return n;
     }
@@ -1141,7 +1512,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         ChannelTask task = tasks[ch];
         for (Map.Entry<java.util.UUID, Assignment> e : turretAssignments.entrySet()) {
             TurretUnit u = turrets.get(e.getKey());
-            if (u != null && u.channel() == ch && e.getValue().taskRev() == task.rev()) n++;
+            if (u != null && commandGroup(u.groups()) == ch && e.getValue().channel() == ch && e.getValue().taskRev() == task.rev()) n++;
         }
         return n;
     }
@@ -1153,7 +1524,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         java.util.Set<String> uniq = new java.util.HashSet<>();
         for (Map.Entry<java.util.UUID, Assignment> e : turretAssignments.entrySet()) {
             TurretUnit u = turrets.get(e.getKey());
-            if (u != null && u.channel() == ch && e.getValue().taskRev() == task.rev()) {
+            if (u != null && commandGroup(u.groups()) == ch && e.getValue().channel() == ch && e.getValue().taskRev() == task.rev()) {
                 uniq.add(e.getValue().targetId());
             }
         }
@@ -1172,7 +1543,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         java.util.LinkedHashSet<String> uniq = new java.util.LinkedHashSet<>();
         for (Map.Entry<java.util.UUID, Assignment> e : turretAssignments.entrySet()) {
             TurretUnit u = turrets.get(e.getKey());
-            if (u != null && u.channel() == ch && e.getValue().taskRev() == task.rev()) {
+            if (u != null && commandGroup(u.groups()) == ch && e.getValue().channel() == ch && e.getValue().taskRev() == task.rev()) {
                 uniq.add(e.getValue().targetId());
             }
         }
@@ -1186,26 +1557,14 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         Assignment a = turretAssignments.get(unitId);
         if (a == null) return null;
         TurretUnit u = turrets.get(unitId);
-        if (u == null || u.channel() < 0) return null;
-        return a.taskRev() == tasks[u.channel()].rev() ? a.targetId() : null;
+        if (u == null || commandGroup(u.groups()) < 0) return null;
+        return a.channel() == commandGroup(u.groups()) && a.taskRev() == tasks[a.channel()].rev() ? a.targetId() : null;
     }
 
-    /** Panel member-row click (exclusive membership, the old Lua group
-     *  semantics): in the active channel -> leave it; elsewhere/ungrouped ->
-     *  join the active channel. @return the unit, null when row out of range */
     public @Nullable TurretUnit toggleTurretChannel(int row) {
-        int i = 0;
-        for (TurretUnit u : turrets.values()) {
-            if (i++ == row) {
-                u.setChannel(u.channel() == activeChannel ? -1 : activeChannel);
-                // 改组 = 该塔退出分配 + 任务立即重算 (修订 E 同原则)
-                turretAssignments.remove(u.id());
-                if (getLevel() instanceof ServerLevel sl) recomputeAssignments(sl);
-                setChanged();
-                return u;
-            }
-        }
-        return null;
+        TurretUnit unit = turretByIndex(row);
+        if (unit != null) editTurretGroup(row, activeChannel, !unit.belongsTo(activeChannel));
+        return unit;
     }
 
     /** Status-page stepper: cycle the ROW TURRET's own cadence through
@@ -1349,6 +1708,243 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         return null;
     }
 
+    /** Axis-gun (轴炮) registration — session-less compass click on an
+     *  fe_railgun MACRO cannon core (axis-gun-design.md §2; detected via
+     *  RailgunLink.macroAt by the caller, NOT a cannon mount). The macro core
+     *  must sit on the SAME main structure as a fire-control core: hull-fixed
+     *  guns aim by pointing the ship, so ground guns and guns on other
+     *  sub-assemblies are rejected. Re-click unregisters.
+     *  @return the chat message body, or null when no core shares the
+     *          gun's main structure (caller keeps its generic hint) */
+    public static @Nullable String toggleFixedGunAt(Level level, BlockPos pos) {
+        if (!(Sable.HELPER.getContaining(level, pos) instanceof ServerSubLevel sub)) return null;
+        java.util.UUID subId = sub.getUniqueId();
+        List<FireControlCoreBlockEntity> cores = REGISTRY.get(level);
+        if (cores == null) return null;
+        for (FireControlCoreBlockEntity core : cores) {
+            if (core.isRemoved() || core.getLevel() == null) continue;
+            if (!(Sable.HELPER.getContaining(core.getLevel(), core.getBlockPos())
+                    instanceof ServerSubLevel coreSub)) continue;
+            if (!coreSub.getUniqueId().equals(subId)) continue;
+            FixedGun existing = null;
+            for (FixedGun g : core.fixedGuns.values()) {
+                if (g.gunPos().equals(pos)) { existing = g; break; }
+            }
+            if (existing != null) {
+                core.fixedGuns.remove(existing.id());
+                core.setChanged();
+                return existing.name() + " 已注销";
+            }
+            if (core.fixedGuns.size() >= MAX_FIXED_GUNS) {
+                return "轴炮已达上限(" + MAX_FIXED_GUNS + ")";
+            }
+            FixedGun gun = new FixedGun(java.util.UUID.randomUUID(),
+                    FixedGun.nextName(core.fixedGuns.values()), pos);
+            core.fixedGuns.put(gun.id(), gun);
+            core.setChanged();
+            return gun.name() + " 已登记(未编组 — 请到核心「武器频道」页编入频道)";
+        }
+        return null;
+    }
+
+    /** All registered axis guns in registration order (3b GUI / 3c pointing). */
+    public java.util.Collection<FixedGun> fixedGuns() {
+        return fixedGuns.values();
+    }
+
+    private int turretGroups() {
+        int mask = 0;
+        for (var unit : turrets.values()) mask |= unit.groups();
+        return mask;
+    }
+
+    private int fixedGunGroups() {
+        int mask = 0;
+        for (var gun : fixedGuns.values()) mask |= gun.groups();
+        return mask;
+    }
+
+    public int axialStrikeChannels() {
+        return WeaponGroups.axialOnly(fixedGunGroups(), turretGroups()) & WeaponGroups.validMask(channelCount);
+    }
+
+    /** Current registration-order row. Never chooses another row on an
+     *  invalid index (turretByIndex rule). */
+    public @Nullable FixedGun fixedGunByIndex(int row) {
+        if (row < 0) return null;
+        int index = 0;
+        for (FixedGun g : fixedGuns.values()) if (index++ == row) return g;
+        return null;
+    }
+
+    /** Explicit membership edit (axis-gun-design.md §4): exclusive channel,
+     *  -1 = ungrouped; does not touch the operator's active channel or any
+     *  channel-wide preference. Axis guns get no TargetAssigner assignments
+     *  in v1 (MULTI_LOCK 不参战), so there is no assignment table to drop. */
+    public boolean setFixedGunChannel(int row, int channel) {
+        if (channel < -1 || channel >= channelCount) return false;
+        FixedGun gun = fixedGunByIndex(row);
+        if (gun == null) return false;
+        return setFixedGunGroups(gun, WeaponGroups.bit(channel));
+    }
+
+    public boolean editFixedGunGroup(int row, int group, boolean join) {
+        if (group < 0 || group >= channelCount) return false;
+        FixedGun gun = fixedGunByIndex(row);
+        if (gun == null) return false;
+        int bit = WeaponGroups.bit(group);
+        return setFixedGunGroups(gun, join ? gun.groups() | bit : gun.groups() & ~bit);
+    }
+
+    private boolean setFixedGunGroups(FixedGun gun, int groups) {
+        if (gun.groups() == groups) return true;
+        if ((groups & ~gun.groups() & turretGroups()) != 0) return false; // N2: 互斥拒绝要回执
+        gun.setGroups(groups);
+        macroReadouts.remove(gun.id());
+        setChanged();
+        return true;
+    }
+
+    // ---------------- 轴炮 3c: 指向触发 + 开火闸门 ----------------
+
+    /** Persistent requester id for the flight core's pointing service. */
+    public java.util.UUID coreUuid() {
+        if (coreUuid == null) {
+            coreUuid = java.util.UUID.randomUUID();
+            setChanged();
+        }
+        return coreUuid;
+    }
+
+    /** The bridge core on our OWN structure (修订 H 一船一核 → first live
+     *  core). Null on ground installations: no hull, no pointing. */
+    private @Nullable BridgeCoreBlockEntity flightCoreOnOwnStructure(ServerLevel sl) {
+        if (!(Sable.HELPER.getContaining(sl, worldPosition) instanceof ServerSubLevel sub)) return null;
+        for (BridgeCoreBlockEntity core : CoreDirectory.coresOf(sub)) {
+            if (!core.isRemoved()) return core;
+        }
+        return null;
+    }
+
+    /** 20 Hz (axis-gun-design.md §5): the FIRST channel holding a resolvable
+     *  PRECISE_LOCK with ≥1 axis-gun member drives the ship's pointing;
+     *  anything else releases. MULTI_LOCK/FOLLOW never point. Renewal rides
+     *  the flight core's 500 ms watchdog; target death/unload ends the task
+     *  via the existing precise watchdog, which lands here as a release. */
+    private void tickAxisGuns(ServerLevel sl) {
+        macroReadouts.clear();
+        if (fixedGuns.isEmpty()) {
+            releaseAxisPointing(sl);
+            return;
+        }
+        int want = -1;
+        double[] target = null;
+        double[] origin = null;
+        for (int i = 0; i < channelCount; i++) {
+            int ch = i == 0 ? activeChannel : i <= activeChannel ? i - 1 : i;
+            ChannelTask task = tasks[ch];
+            if (task.mode() != ChannelTask.Mode.PRECISE_LOCK) continue;
+            Target contact = resolveTaskTarget(task.preciseId());
+            if (contact == null) continue;
+            double[] fresh = refreshLockedFast(sl, contact);
+            if (fresh == null) continue;
+            for (FixedGun gun : fixedGuns.values()) {
+                if (commandGroup(gun) != ch) continue;
+                origin = RailgunLink.macroBeamAxis(RailgunLink.macroAt(sl, gun.gunPos()));
+                if (origin != null) break;
+            }
+            if (origin == null) continue;
+            want = ch;
+            target = fresh;
+            break;
+        }
+        BridgeCoreBlockEntity flight = want < 0 ? null : flightCoreOnOwnStructure(sl);
+        if (flight == null) {
+            releaseAxisPointing(sl);
+        } else {
+            // POINT_AT_DIR (2026-11-08 实机视差修复, 飞控 36f38fe 建议):
+            // TRACK_ENTITY/POINT_AT_POS 从**船逻辑中心**对准, 与射束闸门的
+            // **炮位原点**对准差一个固定视差(≈炮位偏移/距离, 实测 3.5°)。
+            // 改发方向向量: dir = 目标 − 该炮射束原点, 两侧基准一致。
+            net.minecraft.world.phys.Vec3 dir = new net.minecraft.world.phys.Vec3(
+                    target[0] - origin[0], target[1] - origin[1], target[2] - origin[2]).normalize();
+            flight.requestPointing(coreUuid(), PointingMode.POINT_AT_DIR, dir,
+                    null, POINTING_MAX_RATE, POINTING_MAX_ACCEL);
+            pointingChannel = want;
+        }
+
+        for (FixedGun gun : fixedGuns.values()) {
+            int group = commandGroup(gun);
+            Object handle = RailgunLink.macroAt(sl, gun.gunPos());
+            int hardware = RailgunLink.macroStatusCode(handle);
+            var aim = macroAim(sl, group, handle, hardware);
+            if (aim.ready() && !salvoWaiting[group] && (salvoFiredGroups & WeaponGroups.bit(group)) == 0
+                    && (channelAutoFire[group] || hHeld[group])) {
+                RailgunLink.macroFire(handle);
+                hardware = RailgunLink.macroStatusCode(handle);
+                if (hardware != RailgunLink.STATUS_READY) aim = new MacroReadout.Aim(
+                        MacroReadout.Gate.HARDWARE, aim.degrees(), aim.distance(), aim.range());
+            }
+            var timing = RailgunLink.macroTiming(handle);
+            macroReadouts.put(gun.id(), new MacroReadout(group, group < 0 ? -1 : tasks[group].rev(),
+                    sl.getGameTime(), hardware, RailgunLink.macroEnergyStored(handle),
+                    RailgunLink.macroEnergyCapacity(handle), RailgunLink.macroHeat(handle),
+                    RailgunLink.macroMaxHeat(handle), timing.shotCost(), timing.warmupTicks(),
+                    timing.cooldownTicks(), timing.phase(), aim));
+        }
+    }
+
+    public @Nullable MacroReadout macroReadout(FixedGun gun) {
+        MacroReadout sample = macroReadouts.get(gun.id());
+        if (sample == null || getLevel() == null) return null;
+        int group = commandGroup(gun);
+        long age = getLevel().getGameTime() - sample.tick();
+        return age >= 0 && age <= 1 && sample.channel() == group
+                && (group < 0 || tasks[group].rev() == sample.taskRev()) ? sample : null;
+    }
+
+    /** Release the pointing request (OFF keeps the link CONNECTED). No-op when
+     *  we own no active request; a foreign requester is never touched. */
+    private void releaseAxisPointing(ServerLevel sl) {
+        if (pointingChannel < 0) return;
+        pointingChannel = -1;
+        BridgeCoreBlockEntity flight = flightCoreOnOwnStructure(sl);
+        if (flight != null) {
+            flight.requestPointing(coreUuid(), PointingMode.OFF, null, null,
+                    POINTING_MAX_RATE, POINTING_MAX_ACCEL);
+        }
+    }
+
+    /** Shared beam verdict for the instrument, single shot, auto and queued salvo. */
+    private MacroReadout.Aim macroAim(ServerLevel level, int group, @Nullable Object handle, int hardware) {
+        var beam = RailgunLink.macroBeamAxis(handle);
+        double range = beam == null ? -1 : beam[6];
+        if (group < 0 || tasks[group].mode() != ChannelTask.Mode.PRECISE_LOCK) {
+            var gate = hardware != RailgunLink.STATUS_READY ? MacroReadout.Gate.HARDWARE
+                    : group < 0 ? MacroReadout.Gate.UNGROUPED : MacroReadout.Gate.NEED_LOCK;
+            return new MacroReadout.Aim(gate, -1, -1, range);
+        }
+        Target target = resolveTaskTarget(tasks[group].preciseId());
+        if (target == null || beam == null) {
+            var gate = hardware != RailgunLink.STATUS_READY ? MacroReadout.Gate.HARDWARE
+                    : target == null ? MacroReadout.Gate.NO_TARGET : MacroReadout.Gate.NO_BEAM;
+            return new MacroReadout.Aim(gate, -1, -1, range);
+        }
+        double[] fresh = refreshLockedFast(level, target);
+        if (fresh == null) return new MacroReadout.Aim(MacroReadout.Gate.NO_TARGET, -1, -1, range);
+        double dx = fresh[0] - beam[0];
+        double dy = fresh[1] - beam[1];
+        double dz = fresh[2] - beam[2];
+        double distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        double dot = distance < 1e-6 ? 1 : (dx * beam[3] + dy * beam[4] + dz * beam[5]) / distance;
+        double angle = Math.toDegrees(Math.acos(Math.max(-1, Math.min(1, dot))));
+        var gate = hardware != RailgunLink.STATUS_READY ? MacroReadout.Gate.HARDWARE
+                : !Double.isFinite(angle) || !Double.isFinite(range) || range <= 0 ? MacroReadout.Gate.NO_BEAM
+                : distance > range ? MacroReadout.Gate.OUT_OF_RANGE
+                : angle > AXIS_GUN_FIRE_TOLERANCE_DEG ? MacroReadout.Gate.ALIGNING : MacroReadout.Gate.READY;
+        return new MacroReadout.Aim(gate, angle, distance, range);
+    }
+
     /** Manual volley (P3 — the fire DECISION belongs to the operator; the
      *  mounts' fire() is just the execution channel). 频道任务协议 v1: H 单击
      *  只消费当前频道的**有效实锁任务**(MULTI_LOCK/PRECISE_LOCK;FOLLOW 是
@@ -1369,7 +1965,8 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
      *  不读执行时的 activeChannel). */
     public @Nullable String fireVolley(@Nullable Level level, int channel) {
         if (!(level instanceof ServerLevel sl)) return null;
-        if (channel < 0 || channel >= CHANNEL_COUNT) return null;
+        if (channel < 0 || channel >= channelCount) return null;
+        if (markedStrike != null && markedStrike.channel == channel) abortMarkedStrike(sl, "火控手动接管，标定打击已取消");
         ChannelTask.Mode taskMode = tasks[channel].mode();
         if (taskMode != ChannelTask.Mode.MULTI_LOCK && taskMode != ChannelTask.Mode.PRECISE_LOCK) {
             return "[火控核心] " + channelNames[channel]
@@ -1379,11 +1976,15 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         List<String> okParts = new ArrayList<>();   // "炮塔 1×2发"
         List<String> failParts = new ArrayList<>(); // "炮塔 2未齐射(炮座2过热)"
         for (TurretUnit u : turrets.values()) {
-            if (u.channel() != channel) continue; // 武器频道: only the commanded channel fires
+            if (commandGroup(u.groups()) != channel) continue; // 武器频道: only the commanded channel fires
             SwivelTurretActuator a = u.actuator();
             List<SwivelTurretActuator.Mount> mounts = a.mounts();
             if (!a.isPaired() || mounts.isEmpty()) continue;
             mounted++;
+            if (currentHudGate(u.id()) == null) {
+                failParts.add(u.name() + "未齐射(等待本组瞄准更新)");
+                continue;
+            }
             Object[] handles = new Object[mounts.size()];
             int[] codes = new int[mounts.size()];
             boolean allReady = true;
@@ -1432,11 +2033,27 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
                 a.noteFireRejected(rej.toString());
             }
         }
+        // 轴炮参战 (3c): PRECISE_LOCK only, beam-axis gate (axisGunGate);
+        // 手动齐射不等冷却但 readiness 仍覆盖炮闩/热量/能量。
+        for (FixedGun g : fixedGuns.values()) {
+            if (commandGroup(g) != channel) continue;
+            mounted++;
+            Object handle = RailgunLink.macroAt(sl, g.gunPos());
+            int code = RailgunLink.macroStatusCode(handle);
+            var aim = macroAim(sl, channel, handle, code);
+            if (!aim.ready()) {
+                failParts.add(g.name() + "未射(" + aim.label(code, RailgunLink.macroTiming(handle).phase()) + ")");
+                continue;
+            }
+            String r = RailgunLink.macroFire(handle);
+            if (r == null) okParts.add(g.name() + "已接受开火请求");
+            else failParts.add(g.name() + "未射(" + r + ")");
+        }
         if (mounted == 0) {
-            return "[火控核心] " + channelNames[channel] + " 无可齐射炮塔(未编组或未挂炮座)";
+            return "[火控核心] " + channelNames[channel] + " 无可齐射成员(未编组或未挂武器)";
         }
         StringBuilder sb = new StringBuilder("[火控核心] 齐射(" + channelNames[channel] + "): ");
-        sb.append(okParts.isEmpty() ? "无炮塔击发" : String.join(" ", okParts));
+        sb.append(okParts.isEmpty() ? "无武器击发" : String.join(" ", okParts));
         for (String f : failParts) {
             sb.append(", ").append(f);
         }
@@ -1477,9 +2094,9 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         TurretUnit unit = turrets.get(id);
         HudGateSample sample = hudGateSamples.get(id);
         if (unit == null || sample == null || getLevel() == null
-                || unit.channel() < 0 || !unit.isReady()) return null;
+                || commandGroup(unit.groups()) < 0 || !unit.isReady()) return null;
         long age = getLevel().getGameTime() - sample.tick();
-        return age >= 0 && age <= 1 && sample.taskRev() == tasks[unit.channel()].rev()
+        return age >= 0 && age <= 1 && sample.channel() == commandGroup(unit.groups()) && sample.taskRev() == tasks[commandGroup(unit.groups())].rev()
                 ? sample.gate() : null;
     }
 
@@ -1648,6 +2265,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
 
     @Override
     public void setRemoved() {
+        if (level instanceof ServerLevel sl) abortMarkedStrike(sl, "火控核心已卸载，标定打击已取消");
         CoreDirectory.deregister(CoreDirectory.BUCKET_FIRE_CONTROL, registeredSubLevel, this);
         registeredSubLevel = null;
         if (level != null && !level.isClientSide) {
@@ -1752,7 +2370,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
      *  任务失效待命。HUD 多实锁的锥裁剪由 HUD 侧推新 prelock 实现,这里只
      *  管扫描半径口径。 */
     private void pruneTasksAfterScan() {
-        for (int ch = 0; ch < CHANNEL_COUNT; ch++) {
+        for (int ch = 0; ch < channelCount; ch++) {
             ChannelTask task = tasks[ch];
             if (task.mode() == ChannelTask.Mode.PRECISE_LOCK) {
                 Target tracked = task.preciseId() == null ? null : registry.targetById(task.preciseId());
@@ -1777,10 +2395,13 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
      *  调), 分配表带 taskRev, rev 变即作废。修订 E: 重算后频道无可用成员
      *  (无 isReady 塔)或无目标 → 任务失效(rev+1); 多塔频道不因单塔校准
      *  整组阵亡。 */
+    private boolean assignmentsDirty;
+
     private void recomputeAssignments(ServerLevel level) {
+        assignmentsDirty = false;
         Map<java.util.UUID, Assignment> prev = new java.util.HashMap<>(turretAssignments);
         turretAssignments.clear();
-        for (int ch = 0; ch < CHANNEL_COUNT; ch++) {
+        for (int ch = 0; ch < channelCount; ch++) {
             ChannelTask task = tasks[ch];
             if (task.mode() != ChannelTask.Mode.MULTI_LOCK) continue;
             java.util.Set<String> pool = task.source() == ChannelTask.Source.HUD
@@ -1805,10 +2426,10 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
             boolean anyMember = false;
             List<ChannelTargetAllocator.Turret> allocation = new ArrayList<>();
             for (TurretUnit unit : turrets.values()) {
-                if (unit.channel() != ch) continue;
-                SwivelTurretActuator turret = unit.actuator();
-                if (!turret.isReady()) continue; // paired + calibrated
+                if (!unit.belongsTo(ch) || !unit.isReady()) continue;
                 anyMember = true;
+                if (commandGroup(unit.groups()) != ch) continue;
+                SwivelTurretActuator turret = unit.actuator();
                 Vec3 cannon = cannonWorldPos(level, turret);
                 if (cannon == null) continue;
                 List<TargetAssigner.Candidate> view = new ArrayList<>(candidates.size());
@@ -1820,12 +2441,12 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
                             dir != null && turret.isDirectionInArc(level, dir)));
                 }
                 Assignment pa = prev.get(unit.id());
-                String prevId = pa != null && pa.taskRev() == task.rev() ? pa.targetId() : null;
+                String prevId = pa != null && pa.channel() == ch && pa.taskRev() == task.rev() ? pa.targetId() : null;
                 allocation.add(new ChannelTargetAllocator.Turret(unit.id().toString(), prevId, view));
             }
             for (var assigned : ChannelTargetAllocator.assign(allocation).entrySet()) {
                 turretAssignments.put(java.util.UUID.fromString(assigned.getKey()),
-                        new Assignment(assigned.getValue(), task.rev()));
+                        new Assignment(assigned.getValue(), ch, task.rev()));
             }
             if (!anyMember) {
                 // 修订 E: 无可用成员 → 任务失效
@@ -1934,6 +2555,29 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         int ch = activeChannel;
         ChannelTask task = tasks[ch];
         int capacity = pairedCountOf(ch);
+        // 轴炮频道 (2026-11-08 实机"火控台锁不上"修复): 无炮塔成员的频道
+        // 点选容量=0 且多实锁会被修订 E 立即失效 —— 轴炮只打精确锁,
+        // 所以点选直接形成 CONSOLE PRECISE_LOCK; 再点同一目标 = 解除。
+        if (capacity == 0) {
+            boolean gunMember = false;
+            for (FixedGun g : fixedGuns.values()) if (g.belongsTo(ch)) { gunMember = true; break; }
+            if (gunMember) {
+                if (task.mode() == ChannelTask.Mode.PRECISE_LOCK
+                        && task.source() == ChannelTask.Source.CONSOLE
+                        && targetId.equals(task.preciseId())) {
+                    releaseTask(ch);
+                    player.sendSystemMessage(Component.literal(
+                            "[火控核心] " + channelNames[ch] + " 取消锁定"));
+                } else {
+                    task.toPrecise(ChannelTask.Source.CONSOLE, targetId);
+                    recomputeAssignments(sl);
+                    player.sendSystemMessage(Component.literal(
+                            "[火控核心] " + channelNames[ch] + " 精确锁 -> " + fmt(t)));
+                }
+                setChanged();
+                return;
+            }
+        }
         if (task.mode() != ChannelTask.Mode.MULTI_LOCK
                 || task.source() != ChannelTask.Source.CONSOLE) {
             task.toMulti(ChannelTask.Source.CONSOLE); // 形成 CONSOLE 多实锁任务
@@ -2019,7 +2663,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
 
     /** Evict a target id from every channel task (whitelist / external veto). */
     private void evictTargetFromAllTasks(String targetId) {
-        for (int ch = 0; ch < CHANNEL_COUNT; ch++) {
+        for (int ch = 0; ch < channelCount; ch++) {
             ChannelTask task = tasks[ch];
             if (task.mode() == ChannelTask.Mode.PRECISE_LOCK
                     && targetId.equals(task.preciseId())) {
@@ -2042,8 +2686,9 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         super.saveAdditional(tag, registries);
         tag.putDouble("scanRadius", scanRadius);
         tag.putBoolean("skyFilter", skyFilter);
+        tag.putInt("groupCount", channelCount);
         tag.putInt("activeChannel", activeChannel);
-        for (int c = 0; c < CHANNEL_COUNT; c++) {
+        for (int c = 0; c < channelCount; c++) {
             tag.putBoolean("chAutoFire" + c, channelAutoFire[c]);
             tag.putBoolean("chAutoPromote" + c, channelAutoPromote[c]);
             tag.putString("chName" + c, channelNames[c]);
@@ -2075,21 +2720,31 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
             units.add(ut);
         }
         tag.put("turretUnits", units);
+        if (coreUuid != null) tag.putUUID("coreUuid", coreUuid);
+        ListTag guns = new ListTag();
+        for (FixedGun g : fixedGuns.values()) {
+            CompoundTag gt = new CompoundTag();
+            g.save(gt);
+            guns.add(gt);
+        }
+        tag.put("fixedGuns", guns);
     }
 
     @Override
     protected void loadAdditional(CompoundTag tag, HolderLookup.Provider registries) {
         super.loadAdditional(tag, registries);
         if (tag.contains("scanRadius")) {
-            scanRadius = Math.max(16, Math.min(1024, tag.getDouble("scanRadius")));
+            // R7-5: Math.min/max pass NaN straight through — gate on finite first.
+            double r = tag.getDouble("scanRadius");
+            scanRadius = Double.isFinite(r) ? Math.max(16, Math.min(1024, r)) : DEFAULT_SCAN_RADIUS;
         }
         if (tag.contains("skyFilter")) {
             skyFilter = tag.getBoolean("skyFilter");
         }
-        if (tag.contains("activeChannel")) {
-            activeChannel = Math.max(0, Math.min(CHANNEL_COUNT - 1, tag.getInt("activeChannel")));
-        }
-        for (int c = 0; c < CHANNEL_COUNT; c++) {
+        channelCount = tag.contains("groupCount")
+                ? Math.max(1, Math.min(WeaponGroups.MAX, tag.getInt("groupCount"))) : WeaponGroups.DEFAULT_COUNT;
+        activeChannel = Math.max(0, Math.min(channelCount - 1, tag.getInt("activeChannel")));
+        for (int c = 0; c < channelCount; c++) {
             if (tag.contains("chAutoFire" + c)) channelAutoFire[c] = tag.getBoolean("chAutoFire" + c);
             // chAutoPromote* absent on pre-④ saves -> keep the ON default
             if (tag.contains("chAutoPromote" + c)) {
@@ -2113,7 +2768,7 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
                 }
                 tasks[c].restore(src, mode, tt.getLong("rev"), sel,
                         tt.contains("preciseId") ? tt.getString("preciseId") : null,
-                        tt.hasUUID("followPlayer") ? tt.getUUID("followPlayer") : null,
+                        hasUuid4(tt, "followPlayer") ? tt.getUUID("followPlayer") : null,
                         tt.getBoolean("promoteSuppressed"));
             }
         }
@@ -2155,10 +2810,43 @@ public class FireControlCoreBlockEntity extends BlockEntity implements MenuProvi
         } else if (tag.contains("turretYawPos")) {
             // Migration from the pre-multi-turret save format: the legacy single
             // actuator wrote its keys into the root tag — wrap them as unit #1.
+            // R7-1: the pre-channel unit had no group mask; without this it
+            // would load with groups=0 and never aim/fire again. Group 0 only —
+            // auto-fire preferences stay OFF (no preference migration).
             TurretUnit u = new TurretUnit(java.util.UUID.randomUUID(), "炮塔 1", this::setChanged, this::getBlockPos);
             u.actuator().load(tag);
+            u.setGroups(WeaponGroups.bit(0));
             turrets.put(u.id(), u);
+            com.bridgecore.BridgeCoreMod.LOGGER.warn(
+                    "[fire-control] migrated legacy single-turret root keys -> 炮塔 1, group 0 (auto-fire stays off)");
         }
+        for (TurretUnit unit : turrets.values()) unit.setGroups(unit.groups() & WeaponGroups.validMask(channelCount));
+        assignmentsDirty = true;
+        fixedGuns.clear();
+        if (hasUuid4(tag, "coreUuid")) coreUuid = tag.getUUID("coreUuid");
+        if (tag.contains("fixedGuns")) {
+            int turretGroups = turretGroups();
+            for (Tag t : tag.getList("fixedGuns", Tag.TAG_COMPOUND)) {
+                FixedGun g = FixedGun.load((CompoundTag) t);
+                // N2: 互斥/越界裁剪必须有日志——老档同频道升级后轴炮脱组
+                // 不能静默(否则玩家只会看到"轴炮不参战"却无任何提示)
+                int before = g.groups();
+                g.setGroups(WeaponGroups.axialOnly(g.groups(), turretGroups) & WeaponGroups.validMask(channelCount));
+                if (g.groups() != before) {
+                    com.bridgecore.BridgeCoreMod.LOGGER.warn(
+                            "[fire-control] 轴炮 {} 载入编组被互斥/越界裁剪: {} -> {}",
+                            g.name(), before, g.groups());
+                }
+                fixedGuns.put(g.id(), g);
+            }
+        }
+    }
+
+    /** R7-2: CompoundTag.hasUUID only checks the tag TYPE — a wrong-length
+     *  int array makes getUUID throw and fails the whole chunk load. Treat
+     *  malformed UUIDs as missing. */
+    static boolean hasUuid4(CompoundTag tag, String key) {
+        return tag.contains(key, Tag.TAG_INT_ARRAY) && tag.getIntArray(key).length == 4;
     }
 
     private static <E extends Enum<E>> E parseEnum(Class<E> type, String name, E fallback) {

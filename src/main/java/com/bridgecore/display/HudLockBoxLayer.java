@@ -227,6 +227,7 @@ public final class HudLockBoxLayer {
                        java.util.List<String> lockedIds, @Nullable String filterText,
                        java.util.List<String> redIds, @Nullable String taskTag,
                        boolean taskActive, boolean preciseTask, boolean targetsOff, boolean commandHud,
+                       int maxCount,
                        Level level, @Nullable ServerSubLevel sub, BlockPos hudPos, Calib cal) {
         int w = canvas.width();
         int h = canvas.height();
@@ -352,9 +353,13 @@ public final class HudLockBoxLayer {
         }
         // Task source tag (SPI v3 §2.29), second top-right row: CONSOLE-sourced
         // task = yellow FCS; HUD-sourced = red LOCK; the command HUD carries an
-        // additional CMD marker. No task -> nothing.
+        // additional CMD marker. HUD multi-lock also shows 实际分配/上限 m/N
+        // (裁断稿 §4：最大目标数和实际分配数分别显示; 精确锁恒 1 目标,不显示).
         if (taskTag != null) {
             String tag = commandHud ? taskTag + " CMD" : taskTag;
+            if ("LOCK".equals(taskTag) && !preciseTask) {
+                tag += " " + redIds.size() + "/" + maxCount;
+            }
             int tagColor = "FCS".equals(taskTag) ? COLOR_FCS : COLOR_BOX;
             drawText(canvas, FILTER_RIGHT_X - textWidth(tag, CJK_LABEL),
                     PIN_TAG_Y, tag, tagColor, CJK_LABEL);

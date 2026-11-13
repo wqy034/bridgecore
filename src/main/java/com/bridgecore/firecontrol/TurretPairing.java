@@ -7,6 +7,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 
+import com.bridgecore.firecontrol.railgun.RailgunLink;
 import dev.simulated_team.simulated.content.blocks.swivel_bearing.SwivelBearingBlockEntity;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
@@ -148,6 +149,16 @@ public final class TurretPairing {
                 String msg = FireControlCoreBlockEntity.toggleMountAt(event.getLevel(), event.getPos());
                 player.sendSystemMessage(Component.literal("[火控核心] " + (msg != null
                         ? msg : "该炮座不属于任何已配对炮塔(不在炮管子结构上)")));
+                return;
+            }
+            // 轴炮 = fe_railgun 宏炮核心 (axis-gun-design.md §1: 自有核心,
+            // 不是 CBC 炮座). Session-less compass click on a macro core
+            // toggles its registration on the core sharing its main structure.
+            if (RailgunLink.macroAt(event.getLevel(), event.getPos()) != null) {
+                event.setCanceled(true);
+                String msg = FireControlCoreBlockEntity.toggleFixedGunAt(event.getLevel(), event.getPos());
+                player.sendSystemMessage(Component.literal("[火控核心] " + (msg != null
+                        ? msg : "轴炮登记需与火控核心同船体主结构(地面/异结构不登记)")));
             }
             return;
         }

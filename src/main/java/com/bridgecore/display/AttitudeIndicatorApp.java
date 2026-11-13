@@ -152,6 +152,10 @@ public final class AttitudeIndicatorApp implements DisplayApp {
     /** ControlMode ordinal, -1 = no core bound. */
     private int flightModeOrdinal = -1;
     private boolean flightCoupled;
+    /** 指向请求存活（对表：POINT 指示必做——姿态被接管时飞行员必须知情）。 */
+    private boolean pointingActive;
+    /** 指向已就位（SETTLED）：POINT 标转绿。 */
+    private boolean pointingSettled;
 
     // ---- lock-box overlay state (fire-control SPI, docs/bridge-fire-shared-handoff
     //      §2.27): snapshot pulled server-side each tick; projection calibration
@@ -170,6 +174,8 @@ public final class AttitudeIndicatorApp implements DisplayApp {
     private boolean lockTaskActive;
     private boolean lockPreciseTask;
     private boolean lockCommandHud;
+    /** HUD 多锁上限（裁断稿 §4：最大目标数与实际分配数分别显示）。 */
+    private int lockMaxCount;
     /** v3.1 no-lock Tab notch: roam layer (aux boxes + dim triangles) off. */
     private boolean lockTargetsOff;
     private Level lockLevel;
@@ -221,6 +227,12 @@ public final class AttitudeIndicatorApp implements DisplayApp {
         this.flightCoupled = hasCore && coupled;
     }
 
+    /** POINT 指示（指向设计稿 v1.1 §5）：指向存活=黄标；SETTLED=绿标。 */
+    public void bindPointing(boolean active, boolean settled) {
+        this.pointingActive = active;
+        this.pointingSettled = settled;
+    }
+
     /** Calibration push for the lock-box projection (the same five params the
      *  core GUI tab 3 edits; v2 2026-10-26: eyeX/eyeY place ONLY the projection
      *  eye point — the client renderer no longer reads them); called every
@@ -249,7 +261,7 @@ public final class AttitudeIndicatorApp implements DisplayApp {
                                java.util.List<String> lockIds, String lockFilterText,
                                java.util.List<String> redIds, String taskTag,
                                boolean taskActive, boolean preciseTask, boolean targetsOff,
-                               boolean commandHud) {
+                               boolean commandHud, int maxCount) {
         this.lockLevel = level;
         this.lockSub = sub;
         this.lockPos = hudPos;
@@ -262,6 +274,7 @@ public final class AttitudeIndicatorApp implements DisplayApp {
         this.lockPreciseTask = preciseTask;
         this.lockTargetsOff = targetsOff;
         this.lockCommandHud = commandHud;
+        this.lockMaxCount = maxCount;
     }
 
     @Override
@@ -371,9 +384,11 @@ public final class AttitudeIndicatorApp implements DisplayApp {
             }
         }
 
-        // ---- top-left: FLT / flight mode (read-only core binding) + P/R ----
-        drawText(canvas, 28 * S, 28 * S - CJK_LABEL, "FLT / " + flightModeText(),
-                8, CJK_LABEL);
+        // ---- top-left: FLT / flight mode (read-only core binding) + P/R;
+        //      POINT 黄标 = 姿态被指向请求接管（设计稿 v1.1 §5 必做项） ----
+        drawText(canvas, 28 * S, 28 * S - CJK_LABEL,
+                "FLT / " + flightModeText() + (pointingActive ? " · POINT" : ""),
+                pointingActive ? (pointingSettled ? 6 : 4) : 8, CJK_LABEL);
         drawText(canvas, 28 * S, 43 * S - CJK_LABEL, "P " + Math.round(Math.toDegrees(pitch))
                 + "   R " + Math.round(Math.toDegrees(roll)), 8, CJK_LABEL);
 
@@ -454,7 +469,7 @@ public final class AttitudeIndicatorApp implements DisplayApp {
         if (lockSnapshot != null) {
             lockLayer.render(canvas, ctx, lockSnapshot, lockIds, lockFilterText,
                     lockRedIds, lockTaskTag, lockTaskActive, lockPreciseTask, lockTargetsOff,
-                    lockCommandHud, lockLevel, lockSub, lockPos,
+                    lockCommandHud, lockMaxCount, lockLevel, lockSub, lockPos,
                     new HudLockBoxLayer.Calib(lockScreenScale, lockCalibX, lockCalibY,
                             lockCalibScale, lockCalibEyeX, lockCalibEyeY));
         }

@@ -24,6 +24,12 @@ public final class StructureEnergyAccount {
     private static final MomentumDistributorBlockEntity[] EMPTY = new MomentumDistributorBlockEntity[0];
 
     private volatile MomentumDistributorBlockEntity[] pools = EMPTY;
+    private final EnduranceEstimator totalEndurance = new EnduranceEstimator();
+    private final EnduranceEstimator bufferEndurance = new EnduranceEstimator();
+    private ServerSubLevel structure;
+    private volatile EnergyStatus status = new EnergyStatus(false, 0.0);
+
+    public record EnergyStatus(boolean hasEnergy, double enduranceSeconds) {}
     /** Whole-FE spent since the last drainSpent() (physics writes, server drains). */
     private final AtomicLong spentSinceLastDrain = new AtomicLong();
     /** Fractional-FE carry: physics-frame costs below 1 FE accumulate here and are
@@ -36,8 +42,9 @@ public final class StructureEnergyAccount {
         @Override
         public int receiveEnergy(int maxReceive, boolean simulate) {
             if (simulate) {
-                long space = totalCapacity() - totalStored();
-                return (int) Math.min(maxReceive, Math.max(0, Math.min(Integer.MAX_VALUE, space)));
+                long space = 0;
+                for (MomentumDistributorBlockEntity pool : pools) space += pool.inputSpace();
+                return (int) Math.min(Math.max(0, maxReceive), space);
             }
             return (int) Math.min(Integer.MAX_VALUE, fillExternal(maxReceive));
         }
@@ -54,7 +61,8 @@ public final class StructureEnergyAccount {
 
         @Override
         public int getMaxEnergyStored() {
-            return (int) Math.min(Integer.MAX_VALUE, totalCapacity());
+            // R6-5 残留：与分配器同款——超容时 max 跟随存量，契约不被破坏。
+            return (int) Math.min(Integer.MAX_VALUE, Math.max(totalCapacity(), totalStored()));
         }
 
         @Override
@@ -72,12 +80,66 @@ public final class StructureEnergyAccount {
      *  distributors (null = no structure / bench core -> account holds nothing,
      *  every spend browns out fully). */
     public void rebind(ServerSubLevel sub) {
+        if (sub != structure) {
+            structure = sub;
+            resetEndurance();
+        }
         if (sub == null) {
             pools = EMPTY;
             return;
         }
         List<MomentumDistributorBlockEntity> list = CoreDirectory.powerPoolsOf(sub);
+        // R6-6：池集合增减也复位 END 窗口——否则拆/装分配器会把存量阶跃
+        // 误当消耗/补充（短时 0 秒或短时 ∞）。
+        boolean changed = list.size() != pools.length;
+        if (!changed) {
+            for (int i = 0; i < pools.length; i++) {
+                if (pools[i] != list.get(i)) { changed = true; break; }
+            }
+        }
+        if (changed) resetEndurance();
         pools = list.toArray(EMPTY);
+    }
+
+    /** Server-thread status shared by the flight core and its displays. */
+    public void updateStatus(double draw, long tick) {
+        long stored = totalStored();
+        double stock = stored;
+        if (structure != null) {
+            for (EnergyExtractorBlockEntity extractor : CoreDirectory.extractorsOf(structure)) {
+                stock += extractor.buffer() + extractor.potentialFe();
+            }
+        }
+        // R6-4：池空但提取器有燃料/heat 时也算有能量——否则 END 闪"无能量"
+        // 且窗口被重预热。
+        boolean hasEnergy = stored > 0 || stock > 0;
+        if (hasEnergy) {
+            // Fuel in an extractor can outlast the buffer when the input limit is binding.
+            double seconds = Math.min(totalEndurance.update(stock, draw, tick),
+                    bufferEndurance.update(stored, draw, tick));
+            status = new EnergyStatus(true, seconds);
+        } else {
+            resetEndurance();
+            status = new EnergyStatus(false, 0.0);
+        }
+    }
+
+    private void resetEndurance() {
+        totalEndurance.reset();
+        bufferEndurance.reset();
+    }
+
+    public EnergyStatus status() { return status; }
+
+    public void beginStep(long tick, long phase, double seconds) {
+        for (MomentumDistributorBlockEntity pool : pools) pool.beginPhysicsStep(tick, phase, seconds);
+    }
+
+    /** FE that the attached distributors can still deliver in this physics substep. */
+    public long availableForStep() {
+        long total = 0;
+        for (MomentumDistributorBlockEntity pool : pools) total += pool.availableOutput();
+        return total;
     }
 
     /**
@@ -91,12 +153,14 @@ public final class StructureEnergyAccount {
      * @return FE affordable for this frame (less than requested = brownout).
      */
     public double trySpend(double fe) {
-        if (fe <= 0.0) {
+        if (!Double.isFinite(fe) || fe <= 0.0) {
             return 0.0;
         }
+        double carry = fractionCarry; // R6-3：brownout 分支要先扣旧账再算比例
         double total = fe + fractionCarry;
         long whole = (long) total;
         if (whole <= 0) {
+            if (availableForStep() == 0) return 0.0;
             // Sub-FE frame: accumulate the debt and grant the write on credit.
             // Returning 0 here made priceWrite both drop the write and scream
             // "pools empty" — small ships (fractional-FE trim frames) ran the
@@ -124,8 +188,9 @@ public final class StructureEnergyAccount {
         }
         // Genuine brownout: the pools cannot cover the matured whole-FE bill.
         // Do not accumulate unpayable debt; scale this frame by what was paid.
+        // R6-3：paid 里含上一帧已授信未收费的旧账 carry，正确比例先扣 carry。
         fractionCarry = 0.0;
-        return fe * ((double) paid / whole);
+        return fe * Math.max(0.0, Math.min(1.0, (paid - carry) / fe));
     }
 
     /** Server thread: FE spent since the last call (resets the counter). Feeds the
@@ -134,23 +199,28 @@ public final class StructureEnergyAccount {
         return spentSinceLastDrain.getAndSet(0);
     }
 
-    /** Server thread: pour externally received FE (core capability receive, legacy
-     *  save migration) into the pools, in snapshot order.
+    /** Server thread: pour externally received FE into the pools, in snapshot order.
      *  @return FE actually accepted (the rest has nowhere to go). */
     public long fillExternal(long amount) {
         long remaining = amount;
         for (MomentumDistributorBlockEntity pool : pools) {
-            while (remaining > 0) {
-                int chunk = (int) Math.min(remaining, MomentumDistributorBlockEntity.CAPACITY);
-                int got = pool.fillCountedExternal(chunk);
-                remaining -= got;
-                if (got < chunk) {
-                    break; // this pool is full
-                }
-            }
             if (remaining <= 0) {
                 break;
             }
+            remaining -= pool.fillCountedExternal((int) Math.min(Integer.MAX_VALUE, remaining));
+        }
+        return amount - remaining;
+    }
+
+    public long restoreLegacy(long amount) {
+        long remaining = amount;
+        for (MomentumDistributorBlockEntity pool : pools) {
+            if (remaining <= 0) break;
+            remaining -= pool.restoreCharge((int) Math.min(Integer.MAX_VALUE, remaining));
+        }
+        for (MomentumDistributorBlockEntity pool : pools) {
+            if (remaining <= 0) break;
+            remaining -= pool.restoreLegacyOverflow((int) Math.min(Integer.MAX_VALUE, remaining));
         }
         return amount - remaining;
     }
@@ -165,7 +235,9 @@ public final class StructureEnergyAccount {
     }
 
     public long totalCapacity() {
-        return (long) pools.length * MomentumDistributorBlockEntity.CAPACITY;
+        long total = 0;
+        for (MomentumDistributorBlockEntity pool : pools) total += pool.capacity();
+        return total;
     }
 
     public boolean hasPools() {

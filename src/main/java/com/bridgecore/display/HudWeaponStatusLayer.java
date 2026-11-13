@@ -28,12 +28,17 @@ public final class HudWeaponStatusLayer {
                     LABEL, HudPalette.LADDER_DIM_BLUE);
             return;
         }
-        c.drawThickLine(LEFT, 84 * S, RIGHT, 84 * S, 8, 3);
-        c.drawThickLine(RIGHT, 84 * S, RIGHT, 88 * S, 8, 3);
-        text(c, LEFT, 99 * S - LABEL, header, LABEL, HudPalette.LADDER_LABEL);
+        var macro = view.macro();
+        // Keep the extra macro row above the right attitude rail's upper cap (y=169).
+        int yOffset = macro == null ? 0 : -8 * S;
+        int frameY = 84 * S + yOffset;
+        int headerY = 99 * S + yOffset - LABEL;
+        c.drawThickLine(LEFT, frameY, RIGHT, frameY, 8, 3);
+        c.drawThickLine(RIGHT, frameY, RIGHT, frameY + 4 * S, 8, 3);
+        text(c, LEFT, headerY, header, LABEL, HudPalette.LADDER_LABEL);
         String status = view.salvoWaiting() ? "等待齐射" : active ? "跟踪" : "待命";
         int statusColor = view.salvoWaiting() ? HudPalette.LADDER_YELLOW : HudPalette.LADDER_LABEL;
-        right(c, RIGHT, 99 * S - LABEL, status, LABEL, statusColor);
+        right(c, RIGHT, headerY, status, LABEL, statusColor);
         int end = RIGHT - width(status, LABEL) - 12;
         int start = LEFT + width(header, LABEL) + 12;
         int n = view.turrets().size();
@@ -43,7 +48,7 @@ public final class HudWeaponStatusLayer {
         if (visible < n) {
             visible = Math.min(n, Math.min(12, Math.max(0, (end - start - width("+" + n, 18) - 8 + 5) / 9)));
             overflow = "+" + (n - visible);
-            right(c, end, 99 * S - LABEL, overflow, 18, HudPalette.LADDER_LABEL);
+            right(c, end, headerY, overflow, 18, HudPalette.LADDER_LABEL);
             end -= width(overflow, 18) + 8;
         }
         int segment = visible == 0 ? 0 : Math.min(12, Math.max(4, (end - start - (visible - 1) * 5) / visible));
@@ -55,25 +60,28 @@ public final class HudWeaponStatusLayer {
                 case TRACKING, WAITING -> 4;
                 default -> 9;
             };
-            c.fillRect(x + i * (segment + 5), 94 * S, segment, 6, color);
+            c.fillRect(x + i * (segment + 5), 94 * S + yOffset, segment, 6, color);
         }
         long tracking = view.turrets().stream().filter(HudTargetProvider.TurretStatusView::tracking).count();
-        String count = tracking + "/" + n;
-        right(c, RIGHT, 118 * S - LABEL, count, LABEL, HudPalette.LADDER_LABEL);
-        text(c, LEFT, 118 * S - NAME, fit(task.name(), NAME, RIGHT - LEFT - width(count, LABEL) - 16),
+        String count = n == 0 && view.macro() != null ? "" : tracking + "/" + n;
+        int nameBaseline = 118 * S + yOffset;
+        right(c, RIGHT, nameBaseline - LABEL, count, LABEL, HudPalette.LADDER_LABEL);
+        text(c, LEFT, nameBaseline - NAME, fit(task.name(), NAME, RIGHT - LEFT - width(count, LABEL) - 16),
                 NAME, active ? HudPalette.LADDER_WHITE : HudPalette.LADDER_LABEL);
 
         Double ratio = view.minimumEnergyRatio();
-        text(c, LEFT, 138 * S - 20, ratio == null ? "E --" : view.partialEnergy() ? "E 部分" : "E 最低",
-                20, HudPalette.LADDER_LABEL);
+        int triggerY = 138 * S + yOffset - 20;
+        if (n > 0 || macro == null)
+            text(c, LEFT, triggerY, ratio == null ? "E --" : view.partialEnergy() ? "E 部分" : "E 最低",
+                    20, HudPalette.LADDER_LABEL);
         if (ratio != null) {
-            int bx = LEFT + 66, by = 135 * S, bw = 98;
+            int bx = LEFT + 66, by = 135 * S + yOffset, bw = 98;
             double clamped = Math.max(0, Math.min(1, ratio));
             c.fillRect(bx, by, bw, 5, 9);
             int color = clamped < .2 ? 5 : clamped < .5 ? 4 : 6;
             c.fillRect(bx, by, (int) Math.round(bw * clamped), 5, color);
         }
-        right(c, RIGHT, 138 * S - 20, view.autoFire() ? "自动扳机" : "手动扳机", 20,
+        right(c, RIGHT, triggerY, view.autoFire() ? "自动扳机" : "手动扳机", 20,
                 view.autoFire() ? HudPalette.LADDER_YELLOW : HudPalette.LADDER_LABEL);
         if (active) {
             String source = task.source() == HudTargetProvider.TaskSource.CONSOLE ? "FCS"
@@ -86,8 +94,14 @@ public final class HudWeaponStatusLayer {
             };
             String targets = task.mode() == HudTargetProvider.TaskMode.FOLLOW ? ""
                     : " · " + task.assignedTargetIds().size() + "目标";
-            right(c, RIGHT, 156 * S - 20, fit(source + " · " + mode + targets, 20, RIGHT - LEFT),
+            right(c, RIGHT, 156 * S + yOffset - 20, fit(source + " · " + mode + targets, 20, RIGHT - LEFT),
                     20, HudPalette.LADDER_LABEL);
+        }
+        if (macro != null) {
+            String summary = "宏炮 " + macro.ready() + "/" + macro.total() + " 可射"
+                    + (macro.reason().isEmpty() ? "" : " · " + macro.reason());
+            right(c, RIGHT, 174 * S + yOffset - 20, fit(summary, 20, RIGHT - LEFT), 20,
+                    macro.ready() == macro.total() ? HudPalette.LADDER_LABEL : HudPalette.LADDER_YELLOW);
         }
     }
 

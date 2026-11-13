@@ -1,0 +1,14 @@
+{
+  "parent": "minecraft:item/generated",
+  "textures": {
+    "layer0": "bridgecore:item/nav_terminal"
+  },
+  "overrides": [
+    {
+      "predicate": {
+        "bridgecore:active": 1.0
+      },
+      "model": "bridgecore:item/nav_terminal_powered"
+    }
+  ]
+}

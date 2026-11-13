@@ -43,6 +43,8 @@ public record CoreKeyBindPayload(BlockPos pos, int channel, int keyCode) impleme
                         payload.channel(), payload.keyCode(), context.player().getName().getString());
                 return;
             }
+            if (!PayloadGuards.menuOpen(context.player(),
+                    com.bridgecore.menu.BridgeCoreMenu.class, payload.pos())) return; // P1-4
             if (context.player().level().getBlockEntity(payload.pos())
                     instanceof BridgeCoreBlockEntity be) {
                 be.setKeyBinding(payload.channel(), payload.keyCode());

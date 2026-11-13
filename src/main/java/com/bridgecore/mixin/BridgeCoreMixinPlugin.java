@@ -8,7 +8,7 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Every mixin in this config targets an OPTIONAL dependency (today: Create
+ * Some mixins in this config target OPTIONAL dependencies (Create
  * Tweaked Controllers; Create Simulated/aeronautics for the fire-control
  * swivel bearing). Skip application when the target mod is absent so the core
  * mod keeps loading without it — same ModList-guard ruling as the client
@@ -27,6 +27,7 @@ public final class BridgeCoreMixinPlugin implements IMixinConfigPlugin {
     public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {
         String simpleName = mixinClassName.substring(mixinClassName.lastIndexOf('.') + 1);
         String requiredMod = REQUIRED_MOD.get(simpleName);
+        if (requiredMod == null) return true;
         // ModList is populated before mixin configs are applied on NeoForge 1.21;
         // a class-resource probe at this phase is unreliable (mod jars may not be
         // visible to the plugin's classloader yet — observed 2026-09-03: probe
@@ -34,7 +35,7 @@ public final class BridgeCoreMixinPlugin implements IMixinConfigPlugin {
         try {
             var modList = net.neoforged.fml.ModList.get();
             if (modList != null) {
-                return requiredMod == null || modList.isLoaded(requiredMod);
+                return modList.isLoaded(requiredMod);
             }
         } catch (Throwable ignored) {
             // fall through to the probe

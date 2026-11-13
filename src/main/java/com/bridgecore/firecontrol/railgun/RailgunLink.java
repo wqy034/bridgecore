@@ -4,7 +4,9 @@ import org.jetbrains.annotations.Nullable;
 
 import com.bridgecore.firecontrol.MountLink;
 import com.bridgecore.firecontrol.ballistics.SolveChain;
+import com.fe_railgun.FERailgunConfig;
 import com.fe_railgun.api.FEGunApi;
+import com.fe_railgun.api.FEMacroHandle;
 import com.fe_railgun.api.FEMountHandle;
 import com.fe_railgun.api.FireStatus;
 
@@ -62,6 +64,97 @@ public final class RailgunLink {
     public static @Nullable FEMountHandle mountAt(Level level, BlockPos pos) {
         if (!available()) return null;
         return FEGunApi.mountAt(level, pos).orElse(null);
+    }
+
+    /** The fe MACRO cannon core (宏炮核心 = 轴炮, axis-gun-design.md) at a
+     *  (yard-frame) position as an OPAQUE handle — macro cores are not mounts
+     *  (no breech/gun-type concept), so this does not go through MountLink.
+     *  Null when fe_railgun is absent / the block is not a macro core. */
+    public static @Nullable Object macroAt(Level level, BlockPos pos) {
+        if (!available() || !level.hasChunkAt(pos)) return null;
+        return FEGunApi.macroAt(level, pos).orElse(null);
+    }
+
+    /** Defensive downcast for the opaque macro handles; never resolves
+     *  fe_railgun types while the mod is absent. */
+    private static @Nullable FEMacroHandle asMacro(@Nullable Object handle) {
+        if (!available()) return null;
+        return handle instanceof FEMacroHandle h ? h : null;
+    }
+
+    /** Macro readiness mapped to the normalized MountLink status codes
+     *  (same FireStatus enum family as mounts; no gun-type NONE concept). */
+    public static int macroStatusCode(@Nullable Object handle) {
+        FEMacroHandle h = asMacro(handle);
+        if (h == null) return STATUS_NO_MOUNT;
+        return switch (h.readiness()) {
+            case READY -> STATUS_READY;
+            case NOT_ASSEMBLED -> STATUS_NOT_ASSEMBLED;
+            case NO_AMMO -> STATUS_NO_AMMO;
+            case INSUFFICIENT_ENERGY -> STATUS_INSUFFICIENT_ENERGY;
+            case OVERHEATED -> STATUS_OVERHEATED;
+            case BREECH_BUSY -> STATUS_BREECH_BUSY;
+            default -> STATUS_NO_MOUNT; // readiness() never returns FIRED
+        };
+    }
+
+    public static long macroEnergyStored(@Nullable Object handle) {
+        FEMacroHandle h = asMacro(handle);
+        return h == null ? 0 : h.energyStored();
+    }
+
+    public static long macroEnergyCapacity(@Nullable Object handle) {
+        FEMacroHandle h = asMacro(handle);
+        return h == null ? 0 : h.energyCapacity();
+    }
+
+    public record MacroTiming(int shotCost, int warmupTicks, int cooldownTicks,
+                              com.bridgecore.firecontrol.MacroReadout.Phase phase) {}
+
+    public static MacroTiming macroTiming(@Nullable Object handle) {
+        FEMacroHandle h = asMacro(handle);
+        var phase = com.bridgecore.firecontrol.MacroReadout.Phase.UNKNOWN;
+        if (h == null) return new MacroTiming(0, 0, 0, phase);
+        phase = switch (h.mountState()) {
+            case CHARGING -> com.bridgecore.firecontrol.MacroReadout.Phase.CHARGING;
+            case READY -> com.bridgecore.firecontrol.MacroReadout.Phase.READY;
+            case WARMUP -> com.bridgecore.firecontrol.MacroReadout.Phase.WARMUP;
+            case FIRING -> com.bridgecore.firecontrol.MacroReadout.Phase.FIRING;
+            case COOLDOWN -> com.bridgecore.firecontrol.MacroReadout.Phase.COOLDOWN;
+        };
+        return new MacroTiming(h.shotCost(), h.warmupTicks(), h.cooldownTicks(), phase);
+    }
+
+    public static int macroHeat(@Nullable Object handle) {
+        FEMacroHandle h = asMacro(handle);
+        return h == null ? 0 : (int) Math.round(h.heat());
+    }
+
+    public static int macroMaxHeat(@Nullable Object handle) {
+        FEMacroHandle h = asMacro(handle);
+        return h == null ? 0 : (int) Math.round(h.maxHeat());
+    }
+
+    /** World-frame beam geometry: {ox,oy,oz, dx,dy,dz(unit), range}.
+     *  Verified against 1.7.0-alpha bytecode: origin and direction are both
+     *  transformed to world by PhysicsSpaceCompat, direction is the core's
+     *  HORIZONTAL_FACING carried by the ship pose. Null when unusable. */
+    public static double @Nullable [] macroBeamAxis(@Nullable Object handle) {
+        FEMacroHandle h = asMacro(handle);
+        if (h == null) return null;
+        FEMacroHandle.BeamAxis axis = h.beamAxis();
+        return new double[]{axis.origin().x(), axis.origin().y(), axis.origin().z(),
+                axis.direction().x(), axis.direction().y(), axis.direction().z(), axis.range()};
+    }
+
+    /** Atomic macro fire (same contract as mounts: READY only fires, failures
+     *  consume nothing). @return null on FIRED, otherwise the rejection's
+     *  enum name. */
+    public static @Nullable String macroFire(@Nullable Object handle) {
+        FEMacroHandle h = asMacro(handle);
+        if (h == null) return "UNAVAILABLE";
+        FireStatus r = h.fire();
+        return r == FireStatus.FIRED ? null : r.name();
     }
 
     /** Defensive downcast for the opaque handles callers hold; null-safe and
@@ -172,6 +265,14 @@ public final class RailgunLink {
     public static double muzzleVelocity(@Nullable Object handle) {
         FEMountHandle h = asHandle(handle);
         return h == null ? 0 : h.muzzleVelocity();
+    }
+
+    static @Nullable MountLink.PreviewLimits previewLimits(@Nullable Object handle) {
+        FEMountHandle h = asHandle(handle);
+        if (h == null || h.gunType() == FEMountHandle.GunType.NONE) return null;
+        return h.gunType() == FEMountHandle.GunType.LASER
+                ? new MountLink.PreviewLimits(0, FERailgunConfig.LASER_RANGE.get())
+                : new MountLink.PreviewLimits(FERailgunConfig.SLUG_MAX_LIFETIME.get(), 0);
     }
 
     public static double heat(@Nullable Object handle) {

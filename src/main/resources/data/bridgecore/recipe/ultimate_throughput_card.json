@@ -1,0 +1,14 @@
+{
+  "neoforge:conditions": [
+    { "type": "neoforge:mod_loaded", "modid": "mekanism" }
+  ],
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "pattern": ["ACA", "CMC", "ACA"],
+  "key": {
+    "A": { "item": "mekanism:ultimate_control_circuit" },
+    "C": { "item": "bridgecore:elite_throughput_card" },
+    "M": { "item": "mekanism:ultimate_induction_provider" }
+  },
+  "result": { "id": "bridgecore:ultimate_throughput_card" }
+}

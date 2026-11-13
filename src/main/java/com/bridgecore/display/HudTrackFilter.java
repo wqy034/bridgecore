@@ -77,6 +77,7 @@ public final class HudTrackFilter {
         int serial = 0;
         int coneDeg = BridgeCoreBlockEntity.HUD_LOCK_CONE_DEFAULT;
         int maxCount = BridgeCoreBlockEntity.HUD_LOCK_MAX_COUNT_DEFAULT;
+        int lockRange = BridgeCoreBlockEntity.HUD_LOCK_RANGE_DEFAULT;
         BridgeCoreBlockEntity core = null;
         if (sub != null) {
             var cores = CoreDirectory.coresOf(sub);
@@ -86,6 +87,7 @@ public final class HudTrackFilter {
                 serial = core.hudLockSpeciesSerial();
                 coneDeg = core.hudLockConeDeg();
                 maxCount = core.hudLockMaxCount();
+                lockRange = core.hudLockRange();
             }
         }
         boolean offNotch = catOrdinal < 0;
@@ -105,6 +107,10 @@ public final class HudTrackFilter {
                 // Same live body center and calibrated eye/basis as drawing.
                 Vector3d p = HudLockBoxLayer.freshPos(level, t.id(), t.pos());
                 Vector3d ray = new Vector3d(p).sub(geo.eye());
+                // 落地④b (评审 J 飞控侧半): GUI tab3 锁定距离滑条接入正式
+                // 候选链——超程目标不进候选/焦点。只裁这里,不裁快照: FCS
+                // 超视距锁的红框/信息区照常读原始快照 (明确豁免)。
+                if (ray.length() > lockRange) continue;
                 var projected = HudProjectionMath.project(ray.dot(geo.rightW()), ray.dot(geo.upW()),
                         -ray.dot(geo.normW()), eyeOffset.dot(geo.rightW()),
                         eyeOffset.dot(geo.upW()), eyeDepth);

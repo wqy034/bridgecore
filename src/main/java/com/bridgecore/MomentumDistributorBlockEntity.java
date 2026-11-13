@@ -6,17 +6,23 @@ import dev.ryanhcode.sable.sublevel.ServerSubLevel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.HolderLookup;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.Tag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.MenuProvider;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.neoforged.neoforge.energy.IEnergyStorage;
+import net.neoforged.neoforge.items.ItemStackHandler;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -30,9 +36,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * over CoreDirectory membership, not world adjacency (ship blocks sit at far-out
  * shipyard coordinates).
  *
- * Threading: the store is an AtomicLong. {@link #tryExtractAtomic} runs on the
- * physics thread (CAS loop); fills, NBT and the capability view run on the server
- * thread. The physics thread never calls setChanged() — the server ticker marks
+ * The buffer synchronizes energy and rate limits between fills and physics spends.
+ * The physics thread never calls setChanged() — the server ticker marks
  * the block dirty when the stored value moved.
  *
  * Directory membership is maintained lazily from the server ticker (the sub-level
@@ -40,11 +45,42 @@ import java.util.concurrent.atomic.AtomicLong;
  * and dropped in setRemoved.
  */
 public class MomentumDistributorBlockEntity extends BlockEntity implements MenuProvider {
-    public static final int CAPACITY = 4_000_000;
-    /** Capability receive cap, FE per transfer. */
-    public static final int MAX_RECEIVE = 1_000_000;
 
-    private final AtomicLong energy = new AtomicLong();
+    /** CC 通道外设缓存（CCIntegration 管理；Object 类型防 CC 缺席加载）。 */
+    private Object ccChannelPeripheral;
+
+    public Object ccChannelPeripheral() {
+        return ccChannelPeripheral;
+    }
+
+    public void setCcChannelPeripheral(Object peripheral) {
+        ccChannelPeripheral = peripheral;
+    }
+
+    public static final int CAPACITY_SOCKET = 0;
+    public static final int THROUGHPUT_SOCKET = 1;
+    public static final int SOCKET_COUNT = 2;
+    public static final int CARDS_PER_SOCKET = 5;
+    private static final int LEGACY_SOCKET_COUNT = 4;
+    private final DistributorPowerBuffer buffer = new DistributorPowerBuffer();
+    private final List<ItemStack> recoveryCards = new ArrayList<>();
+    private final ItemStackHandler cards = new ItemStackHandler(SOCKET_COUNT) {
+        @Override
+        public int getSlotLimit(int slot) {
+            return CARDS_PER_SOCKET;
+        }
+
+        @Override
+        public boolean isItemValid(int slot, ItemStack stack) {
+            return stack.getItem() instanceof DistributorUpgradeItem card
+                    && card.capacityCard() == (slot == CAPACITY_SOCKET);
+        }
+
+        @Override
+        protected void onContentsChanged(int slot) {
+            upgradeCardsChanged();
+        }
+    };
     /** GUI rate readouts: fills/extracts accumulate into inAccum/outAccum as they
      *  happen; every RATE_WINDOW ticks the serverTicker settles the window average
      *  into rateIn/rateOut (FE/t) and resets the accumulators. The menu only reads
@@ -79,66 +115,88 @@ public class MomentumDistributorBlockEntity extends BlockEntity implements MenuP
         return storage;
     }
 
-    /** CAS fill helper (server thread). @return FE actually accepted. */
-    private long fill(long amount) {
-        if (amount <= 0) {
-            return 0;
-        }
-        for (;;) {
-            long cur = energy.get();
-            long space = CAPACITY - cur;
-            if (space <= 0) {
-                return 0;
-            }
-            long add = Math.min(amount, space);
-            if (energy.compareAndSet(cur, cur + add)) {
-                inAccum += add;
-                return add;
-            }
+    public ItemStackHandler cards() { return cards; }
+    public int capacity() { return buffer.capacity(); }
+    public int maxReceive() { return buffer.inputRate(); }
+    public int maxOutput() { return buffer.outputRate(); }
+
+    public void upgradeCardsChanged() {
+        if (level != null && !level.isClientSide) {
+            refreshLimits();
+            setChanged();
         }
     }
 
-    /** Internal fill from same-structure extractors (server thread); bypasses the
-     *  capability rate cap. NOT counted in the inflow meter — fuel burn is finite,
-     *  the endurance estimate treats it as consumption, not supply. */
+    private void refreshLimits() {
+        int capacity = BCConfig.POOL_CAPACITY.get();
+        int input = BCConfig.POOL_MAX_RECEIVE.get();
+        int output = BCConfig.POOL_MAX_OUTPUT.get();
+        for (int slot = 0; slot < SOCKET_COUNT; slot++) {
+            ItemStack stack = cards.getStackInSlot(slot);
+            if (cards.isItemValid(slot, stack) && stack.getItem() instanceof DistributorUpgradeItem card) {
+                int count = Math.min(CARDS_PER_SOCKET, stack.getCount());
+                capacity += card.capacityBonus() * count;
+                input += card.inputBonus() * count;
+                output += card.outputBonus() * count;
+            }
+        }
+        buffer.configure(capacity, input, output);
+    }
+
+    int restoreCharge(int amount) {
+        int accepted = buffer.restore(amount);
+        inAccum += accepted;
+        return accepted;
+    }
+
+    int restoreLegacyOverflow(int amount) {
+        return buffer.restoreLegacyOverflow(amount);
+    }
+
+    /** Internal fill shares the input budget, while finite fuel stays out of the grid meter. */
     int fillInternal(int amount) {
-        return (int) fill(amount);
+        return receive(amount, false);
     }
 
-    /** External-supply fill (capability receives, incl. those routed through the
-     *  core's StructureEnergyAccount): like {@link #fillInternal} but counted in
-     *  the inflow meter. */
     int fillCountedExternal(int amount) {
-        int accepted = (int) fill(amount);
+        int accepted = receive(amount, false);
         inflowAccum += accepted;
         return accepted;
+    }
+
+    private int receive(int amount, boolean simulate) {
+        if (level == null || isRemoved()) return 0;
+        int accepted = buffer.receive(amount, level.getGameTime(), simulate);
+        if (!simulate) inAccum += accepted;
+        return accepted;
+    }
+
+    void beginPhysicsStep(long tick, long phase, double seconds) {
+        buffer.beginStep(tick, phase, seconds);
+    }
+
+    int availableOutput() {
+        return isRemoved() ? 0 : buffer.available();
     }
 
     /** Physics-thread spend by same-structure cores (via StructureEnergyAccount);
      *  the capability view stays receive-only. */
     long tryExtractAtomic(long maxAmount) {
-        if (maxAmount <= 0) {
-            return 0;
-        }
-        for (;;) {
-            long cur = energy.get();
-            if (cur <= 0) {
-                return 0;
-            }
-            long take = Math.min(maxAmount, cur);
-            if (energy.compareAndSet(cur, cur - take)) {
-                outAccum.addAndGet(take);
-                return take;
-            }
-        }
+        int paid = isRemoved() ? 0 : buffer.spend(maxAmount);
+        if (paid > 0) outAccum.addAndGet(paid);
+        return paid;
     }
 
     int space() {
-        return (int) Math.max(0, CAPACITY - energy.get());
+        return Math.max(0, capacity() - energy());
+    }
+
+    int inputSpace() {
+        return level == null || isRemoved() ? 0 : buffer.inputSpace(level.getGameTime());
     }
 
     public int energy() {
-        return (int) Math.min(Integer.MAX_VALUE, energy.get());
+        return buffer.stored();
     }
 
     /** Settled GUI readouts: average FE/t over the last 20-tick window. */
@@ -166,12 +224,19 @@ public class MomentumDistributorBlockEntity extends BlockEntity implements MenuP
     @Nullable
     @Override
     public AbstractContainerMenu createMenu(int containerId, Inventory playerInventory, Player player) {
+        if (!player.level().isClientSide && !recoveryCards.isEmpty()) {
+            for (ItemStack card : recoveryCards) playerInventory.placeItemBackInInventory(card);
+            recoveryCards.clear();
+            setChanged();
+            player.sendSystemMessage(Component.translatable("gui.bridgecore.distributor.recovered_cards"));
+        }
         return new MomentumDistributorMenu(containerId, playerInventory, this);
     }
 
     public static void serverTick(Level level, BlockPos pos, BlockState state,
                                   MomentumDistributorBlockEntity be) {
         be.syncDirectory(level, pos);
+        be.refreshLimits();
         be.inflowFePerTick += (be.inflowAccum - be.inflowFePerTick) * INFLOW_SMOOTH_ALPHA;
         be.inflowAccum = 0;
         if (++be.windowTick >= RATE_WINDOW) {
@@ -180,7 +245,7 @@ public class MomentumDistributorBlockEntity extends BlockEntity implements MenuP
             be.inAccum = 0;
             be.windowTick = 0;
         }
-        long stored = be.energy.get();
+        long stored = be.energy();
         if (stored != be.lastSeenEnergy) {
             be.lastSeenEnergy = stored;
             be.setChanged();
@@ -201,6 +266,7 @@ public class MomentumDistributorBlockEntity extends BlockEntity implements MenuP
     public void onLoad() {
         super.onLoad();
         if (level != null && !level.isClientSide) {
+            refreshLimits();
             syncDirectory(level, getBlockPos());
         }
     }
@@ -216,24 +282,77 @@ public class MomentumDistributorBlockEntity extends BlockEntity implements MenuP
     protected void saveAdditional(CompoundTag tag, HolderLookup.Provider registries) {
         super.saveAdditional(tag, registries);
         tag.putInt("fe", energy());
+        tag.put("upgradeCards", cards.serializeNBT(registries));
+        if (!recoveryCards.isEmpty()) {
+            ListTag saved = new ListTag();
+            for (ItemStack card : recoveryCards) saved.add(card.save(registries));
+            tag.put("recoveryCards", saved);
+        }
     }
 
     @Override
     protected void loadAdditional(CompoundTag tag, HolderLookup.Provider registries) {
         super.loadAdditional(tag, registries);
-        energy.set(Math.max(0, Math.min(CAPACITY, tag.getInt("fe"))));
+        // Older saves and removed capacity cards can leave an overfull buffer.
+        // Keep its balance and block new charge until it falls below capacity.
+        buffer.load(tag.getInt("fe"));
+        recoveryCards.clear();
+        for (Tag saved : tag.getList("recoveryCards", Tag.TAG_COMPOUND)) {
+            ItemStack.parse(registries, saved).ifPresent(this::recoverCard);
+        }
+        CompoundTag cardData = tag.getCompound("upgradeCards").copy();
+        if (cardData.getInt("Size") == LEGACY_SOCKET_COUNT) {
+            migrateLegacyCards(registries, cardData);
+            return;
+        }
+        cardData.putInt("Size", SOCKET_COUNT);
+        cards.deserializeNBT(registries, cardData);
+    }
+
+    private void migrateLegacyCards(HolderLookup.Provider registries, CompoundTag cardData) {
+        // R7-4：卡槽迁移留日志。
+        BridgeCoreMod.LOGGER.warn("[bridgecore] distributor legacy cards migrated at {}",
+                getBlockPos().toShortString());
+        ItemStackHandler legacy = new ItemStackHandler(LEGACY_SOCKET_COUNT);
+        legacy.deserializeNBT(registries, cardData);
+        for (int slot = 0; slot < SOCKET_COUNT; slot++) {
+            ItemStack first = legacy.getStackInSlot(slot * 2);
+            ItemStack second = legacy.getStackInSlot(slot * 2 + 1);
+            if (upgradeStrength(second) > upgradeStrength(first)) {
+                ItemStack swap = first;
+                first = second;
+                second = swap;
+            }
+            cards.setStackInSlot(slot, ItemStack.EMPTY);
+            recoverCard(cards.insertItem(slot, first, false));
+            recoverCard(cards.insertItem(slot, second, false));
+        }
+    }
+
+    private static int upgradeStrength(ItemStack stack) {
+        return stack.getItem() instanceof DistributorUpgradeItem card ? card.capacityBonus() + card.outputBonus() : 0;
+    }
+
+    private void recoverCard(ItemStack card) {
+        if (!card.isEmpty()) recoveryCards.add(card);
+    }
+
+    void addCardDrops(List<ItemStack> drops) {
+        for (int slot = 0; slot < SOCKET_COUNT; slot++) {
+            ItemStack card = cards.getStackInSlot(slot);
+            if (!card.isEmpty()) drops.add(card.copy());
+        }
+        for (ItemStack card : recoveryCards) drops.add(card.copy());
     }
 
     /** External capability view: charge-only, rate-capped (server thread). */
     private final class StorageView implements IEnergyStorage {
         @Override
         public int receiveEnergy(int maxReceive, boolean simulate) {
-            int capped = Math.min(maxReceive, MAX_RECEIVE);
             if (simulate) {
-                return Math.min(capped, space());
+                return receive(maxReceive, true);
             }
-            int accepted = fillCountedExternal(capped);
-            return accepted;
+            return fillCountedExternal(maxReceive);
         }
 
         @Override
@@ -248,7 +367,10 @@ public class MomentumDistributorBlockEntity extends BlockEntity implements MenuP
 
         @Override
         public int getMaxEnergyStored() {
-            return CAPACITY;
+            // R6-5：拆卡/legacy 超容时对外 max 跟随存量，守住 stored<=max 的
+            // IEnergyStorage 契约；存量本身不吞（load 只夹非负），接收侧按
+            // capacity-stored 算空间，超容时自然停止接收。
+            return Math.max(capacity(), energy());
         }
 
         @Override
