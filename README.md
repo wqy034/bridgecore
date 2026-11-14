@@ -4,6 +4,8 @@
 
 当前版本：0.1.3，Minecraft 1.21.1 / NeoForge。
 
+[下载 BridgeCore JAR（Releases）](https://github.com/wqy034/bridgecore/releases/latest) · [安装与运行依赖](#安装与运行依赖)
+
 ## 功能概览
 
 - **飞行控制**：关闭、增稳和星舰三种模式；支持推力档位、姿态保持、自平衡、高度跟随和重力补偿。
